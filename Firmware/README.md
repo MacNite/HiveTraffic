@@ -307,6 +307,9 @@ with targets present points at that bank's FET or supply.
 
 ### Guided gate test
 
+> Step-by-step manual, including what each failure means and what to check:
+> [`docs/bench-test.md`](../docs/bench-test.md).
+
 [`tools/gate_test.py`](tools/gate_test.py) runs the whole bench check over the
 console for you and walks you through it, gate by gate. You need a target, and
 a strip of white paper is enough. Run it with the housing fitted, because
