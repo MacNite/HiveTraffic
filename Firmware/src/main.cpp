@@ -742,7 +742,30 @@ static bool pollAllGates() {
 // ----------------------------------------------------------------------------
 // BLE transport callbacks (defined here because the counter state lives in this
 // translation unit). ble_link.cpp drives the GATT server and calls into these.
+//
+// They run on the NimBLE host task, which on this single-core chip outranks
+// loopTask and can preempt it anywhere — in the middle of a lit sampling
+// window, half-way through one gate's state update, or between a read and a
+// write of g_status_flags. So nothing here changes counter state. The
+// telemetry and read-back calls only read it; the two control writes are
+// posted to a mailbox that loop() applies between polls (see
+// serviceControlRequests() below), which makes loop() the one owner of the
+// gates, the banks, night mode and the maintenance session.
 // ----------------------------------------------------------------------------
+
+// Control writes waiting for loop(). Latest wins within each kind, which is
+// what both mean: a RESUME after a SET_IDLE in the same instant is a resume,
+// and of two masks the second is the one HiveHub wants. Guarded by a critical
+// section rather than a mutex because it is held for a few word copies.
+struct ControlMailbox {
+    bool     idle_pending = false;
+    uint32_t idle_s = 0;
+    bool     banks_pending = false;
+    uint8_t  banks = 0;
+};
+static ControlMailbox g_ctrl_mailbox;
+static portMUX_TYPE g_ctrl_mux = portMUX_INITIALIZER_UNLOCKED;
+
 namespace ble {
 
 void getTelemetry(Telemetry& t) {
@@ -791,9 +814,10 @@ void getTelemetry(Telemetry& t) {
 
 }  // namespace ble
 
-// Apply a night-mode request immediately. ble::applyIdleRequest() below is the
-// HiveHub entry point and defers to this outside maintenance; ending a
-// maintenance session replays a deferred request through it.
+// Apply a night-mode request immediately. HiveHub's requests reach it through
+// handleIdleRequest() below, outside maintenance; ending a maintenance session
+// replays a deferred request through it. loop() only, like everything that
+// changes the gates or the emitters.
 static uint32_t applyIdleNow(uint32_t duration_s) {
     const bool was_sensing = idlestate::sensing(g_idle);
     const idlestate::Request r =
@@ -851,18 +875,64 @@ static uint8_t applyBankMaskNow(uint8_t mask) {
     return r.granted;
 }
 
-namespace ble {
-
-uint32_t applyIdleRequest(uint32_t duration_s) {
-    if (!g_maint.active) return applyIdleNow(duration_s);
-    // Maintenance owns the emitters until it ends. Hold the request — clamped
-    // exactly as it would have been — and replay what is left of it then, so
-    // the counter still ends up where HiveHub wants it.
+// Apply a HiveHub night-mode request. Outside maintenance it takes effect at
+// once; maintenance owns the emitters until it ends, so the request is held —
+// clamped exactly as it would have been — and what is left of it is replayed
+// then, so the counter still ends up where HiveHub wants it. loop() only.
+static void handleIdleRequest(uint32_t duration_s) {
+    if (!g_maint.active) {
+        applyIdleNow(duration_s);
+        return;
+    }
     idlestate::State probe;
     const uint32_t granted = idlestate::request(probe, millis(), duration_s).granted_s;
     maintstate::deferIdle(g_maint, millis(), granted);
     slog::printf("[MAINT] HiveHub night mode %lus held until maintenance ends",
                  (unsigned long)granted);
+}
+
+// The same for a bank mask, validated by the same rules (an all-off mask is
+// still refused) and then held like a night-mode request. loop() only.
+static void handleBankRequest(uint8_t mask) {
+    if (!g_maint.active) {
+        applyBankMaskNow(mask);
+        return;
+    }
+    bankstate::State probe = g_banks;
+    const bankstate::Request r = bankstate::request(probe, mask);
+    if (!r.accepted) {
+        slog::printf("[BANKS] request 0x%02X refused; still 0x%02X",
+                     (unsigned)mask, (unsigned)g_banks.mask);
+        return;
+    }
+    maintstate::deferBanks(g_maint, r.granted);
+    slog::printf("[MAINT] HiveHub bank mask 0x%02X held until maintenance ends",
+                 (unsigned)r.granted);
+}
+
+// Apply whatever the control characteristic posted since the last pass. Called
+// at the top of loop(), so a request always lands between two polls.
+static void serviceControlRequests() {
+    portENTER_CRITICAL(&g_ctrl_mux);
+    const ControlMailbox m = g_ctrl_mailbox;
+    g_ctrl_mailbox = ControlMailbox();
+    portEXIT_CRITICAL(&g_ctrl_mux);
+
+    if (m.banks_pending) handleBankRequest(m.banks);
+    if (m.idle_pending) handleIdleRequest(m.idle_s);
+}
+
+namespace ble {
+
+// The return values are what the request WILL do, worked out on copies by the
+// same pure rules loop() applies, so ble_link.cpp can log and answer at once.
+uint32_t applyIdleRequest(uint32_t duration_s) {
+    idlestate::State probe;
+    const uint32_t granted = idlestate::request(probe, millis(), duration_s).granted_s;
+    portENTER_CRITICAL(&g_ctrl_mux);
+    g_ctrl_mailbox.idle_pending = true;
+    g_ctrl_mailbox.idle_s = duration_s;
+    portEXIT_CRITICAL(&g_ctrl_mux);
     return granted;
 }
 
@@ -871,20 +941,15 @@ uint32_t idleRemainingSeconds() {
 }
 
 uint8_t applyBankMask(uint8_t mask) {
-    if (!g_maint.active) return applyBankMaskNow(mask);
-    // Validated by the same rules (an all-off mask is still refused), then
-    // held like a night-mode request.
     bankstate::State probe = g_banks;
     const bankstate::Request r = bankstate::request(probe, mask);
-    if (!r.accepted) {
-        slog::printf("[BANKS] request 0x%02X refused; still 0x%02X",
-                     (unsigned)mask, (unsigned)g_banks.mask);
-        return g_banks.mask;
-    }
-    maintstate::deferBanks(g_maint, r.granted);
-    slog::printf("[MAINT] HiveHub bank mask 0x%02X held until maintenance ends",
-                 (unsigned)r.granted);
-    return r.granted;
+    // A refused mask is still posted, so loop() logs the refusal where it
+    // logs everything else about the banks; it changes nothing there either.
+    portENTER_CRITICAL(&g_ctrl_mux);
+    g_ctrl_mailbox.banks_pending = true;
+    g_ctrl_mailbox.banks = mask;
+    portEXIT_CRITICAL(&g_ctrl_mux);
+    return r.accepted ? r.granted : g_banks.mask;
 }
 
 uint8_t bankMask() {
@@ -1298,6 +1363,10 @@ void loop() {
     // Services the deferred post-OTA reboot, once the central has had a chance
     // to read DONE off the status characteristic.
     ble::loopOta();
+
+    // Night-mode and bank writes from HiveHub, applied here between polls
+    // rather than on the NimBLE task that received them.
+    serviceControlRequests();
 
     const uint32_t now = millis();
 

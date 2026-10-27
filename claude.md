@@ -79,6 +79,11 @@ backend.
   debug image. Never print with `Serial.print*()` — use `slog::printf()`, which
   drops a line rather than stall the 5 ms sampler when the USB host is not
   reading.
+- **`loop()` owns the counter state.** NimBLE callbacks run on the host task,
+  which preempts `loopTask` anywhere on this single-core chip. A GATT callback
+  may read counter state but must never change the gates, emitters, banks,
+  night mode or the maintenance session: control writes are posted to the
+  mailbox in `main.cpp` and applied by `serviceControlRequests()` between polls.
 - **Maintenance mode fails open, like night mode.** The USB console's
   `maint on` freezes the totals and holds HiveHub's requests back, so it must
   always end: 30 min without a command, an OTA, or a reset. Never persist it,

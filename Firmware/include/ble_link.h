@@ -47,21 +47,23 @@ struct Telemetry {
 
 void getTelemetry(Telemetry& out);
 
-// Apply a night-mode request written to the control characteristic.
+// Post a night-mode request written to the control characteristic.
 // Implemented in main.cpp, where the suspension state and the emitters live;
-// declared here because ble_link.cpp is what receives the write.
-// `duration_s` of 0 resumes sensing. Returns the duration actually granted
+// declared here because ble_link.cpp is what receives the write. The request is
+// applied by loop() before its next poll, never on the calling (NimBLE) task.
+// `duration_s` of 0 resumes sensing. Returns the duration that will be granted
 // after clamping to beecounter_proto::MAX_IDLE_SECONDS.
 uint32_t applyIdleRequest(uint32_t duration_s);
 
 // Seconds of suspension left, for the control characteristic's read-back.
 uint32_t idleRemainingSeconds();
 
-// Apply an emitter-bank enable mask written to the control characteristic.
+// Post an emitter-bank enable mask written to the control characteristic.
 // Implemented in main.cpp alongside applyIdleRequest(), for the same reason:
-// the FET pins and the gate state machines live there. Returns the mask
-// actually in force afterwards, which is the unchanged one if the request was
-// refused (see bank_state.h — a mask of 0 is never applied).
+// the FET pins and the gate state machines live there, and loop() applies it
+// before its next poll. Returns the mask that will be in force, which is the
+// unchanged one if the request is refused (see bank_state.h — a mask of 0 is
+// never applied).
 uint8_t applyBankMask(uint8_t mask);
 
 // The enabled-bank mask currently in force, for the control characteristic's
