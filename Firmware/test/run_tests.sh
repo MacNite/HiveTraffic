@@ -31,6 +31,9 @@
 #   * include/maint_state.h     — maintenance sessions: the inactivity timeout,
 #                                 the replay of HiveHub's deferred requests and
 #                                 the maint_s figure;
+#   * include/ota_session.h     — the OTA frame rules: the stall timeout that
+#                                 hands a hung transfer back to counting, and
+#                                 DONE as a terminal state;
 #   * tools/gate_test.py        — the guided bench gate test, run against a
 #                                 simulated console (python3, no hardware).
 #
@@ -49,7 +52,8 @@ OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
 for t in gate_logic measurement_json idle_state bank_state device_name \
-         log_line poll_timing console_line event_ring diag_format maint_state; do
+         log_line poll_timing console_line event_ring diag_format maint_state \
+         ota_session; do
     "$CXX" -std=c++11 -Wall -Wextra -Werror \
         -I include \
         "test/test_$t/test_$t.cpp" \

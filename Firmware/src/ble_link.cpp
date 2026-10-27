@@ -4,11 +4,14 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <Update.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <stdio.h>
 
 #include "counter_protocol.h"
 #include "device_name.h"
 #include "measurement_json.h"
+#include "ota_session.h"
 #include "serial_log.h"
 #include "version.h"
 
@@ -34,9 +37,6 @@ constexpr char CHR_OTA_CTRL[] = "8e8b0110-7a1c-4b9e-9a2f-1d6e0b9c1a01";
 constexpr char CHR_OTA_DATA[] = "8e8b0111-7a1c-4b9e-9a2f-1d6e0b9c1a01";
 constexpr char CHR_OTA_STATUS[] = "8e8b0113-7a1c-4b9e-9a2f-1d6e0b9c1a01";
 constexpr uint16_t ADV_INTERVAL_UNITS = 1600;  // 1600 * 0.625 ms = 1 second
-constexpr uint8_t OTA_OP_BEGIN = 0x01;
-constexpr uint8_t OTA_OP_END = 0x03;
-constexpr uint8_t OTA_OP_ABORT = 0x04;
 constexpr uint32_t OTA_REBOOT_DELAY_MS = 1500;
 // How often, at most, a DATA write refreshes the OTA status characteristic and
 // notifies subscribers.
@@ -62,6 +62,23 @@ uint32_t otaExpectedCrc = 0;
 uint32_t otaRunningCrc = 0xFFFFFFFFUL;
 uint32_t otaRebootAt = 0;
 uint32_t otaLastNotifyMs = 0;
+// millis() of the BEGIN or of the last accepted DATA write; what the stall
+// timeout in loopOta() measures from (ota_session.h).
+uint32_t otaLastProgressMs = 0;
+
+// The OTA state above is written from the NimBLE host task (the GATT callbacks)
+// and, for the stall timeout, from loop(). Every path that changes it holds this
+// lock, so a timeout can never call Update.abort() underneath an Update.write()
+// that is still running. Created in begin(), before any callback can fire.
+SemaphoreHandle_t otaLock = nullptr;
+
+class OtaLockGuard {
+public:
+    OtaLockGuard() { xSemaphoreTake(otaLock, portMAX_DELAY); }
+    ~OtaLockGuard() { xSemaphoreGive(otaLock); }
+    OtaLockGuard(const OtaLockGuard&) = delete;
+    OtaLockGuard& operator=(const OtaLockGuard&) = delete;
+};
 
 static uint32_t crc32Update(uint32_t crc, const uint8_t* data, size_t length) {
     while (length--) {
@@ -97,12 +114,18 @@ static void publishOtaStatus() {
     otaLastNotifyMs = millis();
 }
 
-static void failOta(uint8_t state) {
+// `publish` is false only for loopOta(), which notifies after it has released
+// otaLock rather than calling into the NimBLE host while holding it.
+static void failOta(uint8_t state, bool publish = true) {
+    // DONE is terminal: the new slot is already the boot partition, so a
+    // failure reported now would be untrue and cancelling the reboot would only
+    // postpone the update to whenever the counter next resets.
+    if (!otasession::mayFail(otaState)) return;
     if (otaState == OTA_STATE_RECEIVING) Update.abort();
     otaRebootAt = 0;
     otaState = state;
     otaError = state;
-    publishOtaStatus();
+    if (publish) publishOtaStatus();
 }
 
 static void refreshMeasurement(NimBLECharacteristic* characteristic) {
@@ -134,9 +157,17 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
         const NimBLEAttValue value = characteristic->getValue();
         if (value.size() == 0) return;
         const uint8_t* data = value.data();
+        OtaLockGuard lock;
 
-        switch (data[0]) {
-        case OTA_OP_BEGIN: {
+        switch (otasession::control(otaState, data[0])) {
+        case otasession::Control::KEEP_DONE:
+            // A repeated END is the expected case: a relay retrying a write
+            // whose response it lost. Answer it with DONE again, idempotently.
+            publishOtaStatus();
+            slog::printf("[BLE-OTA] opcode 0x%02X after DONE ignored; rebooting "
+                         "into the verified image\n", (unsigned)data[0]);
+            break;
+        case otasession::Control::BEGIN: {
             if (value.size() != 9) {
                 failOta(OTA_STATE_ERR_BEGIN);
                 return;
@@ -153,6 +184,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
             otaReceived = 0;
             otaRunningCrc = 0xFFFFFFFFUL;
             otaRebootAt = 0;
+            otaLastProgressMs = millis();
             if (otaSize == 0 || !Update.begin(otaSize)) {
                 slog::printf("[BLE-OTA] BEGIN rejected: size=%lu error=%s\n",
                               static_cast<unsigned long>(otaSize),
@@ -168,7 +200,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
                           static_cast<unsigned long>(otaExpectedCrc));
             break;
         }
-        case OTA_OP_END: {
+        case otasession::Control::END: {
             if (otaState != OTA_STATE_RECEIVING) {
                 failOta(OTA_STATE_ERR_SEQ);
                 return;
@@ -192,7 +224,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
             slog::printf("[BLE-OTA] verified; reboot scheduled");
             break;
         }
-        case OTA_OP_ABORT:
+        case otasession::Control::ABORT:
             if (otaState == OTA_STATE_RECEIVING) Update.abort();
             otaState = OTA_STATE_IDLE;
             otaError = OTA_ERR_NONE;
@@ -200,7 +232,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
             otaRebootAt = 0;
             publishOtaStatus();
             break;
-        default:
+        case otasession::Control::FAIL_SEQ:
             failOta(OTA_STATE_ERR_SEQ);
             break;
         }
@@ -211,11 +243,15 @@ class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
         const NimBLEAttValue value = characteristic->getValue();
         const size_t length = value.size();
-        if (length == 0) return;
-        if (otaState != OTA_STATE_RECEIVING || otaReceived > otaSize ||
-            length > otaSize - otaReceived) {
+        OtaLockGuard lock;
+        switch (otasession::data(otaState, otaReceived, otaSize, length)) {
+        case otasession::Data::IGNORE:
+            return;
+        case otasession::Data::FAIL_SEQ:
             failOta(OTA_STATE_ERR_SEQ);
             return;
+        case otasession::Data::ACCEPT:
+            break;
         }
         const uint8_t* data = value.data();
         if (Update.write(const_cast<uint8_t*>(data), length) != length) {
@@ -224,6 +260,7 @@ class OtaDataCallbacks : public NimBLECharacteristicCallbacks {
         }
         otaRunningCrc = crc32Update(otaRunningCrc, data, length);
         otaReceived += length;
+        otaLastProgressMs = millis();
 
         // Throttled progress. Without this the characteristic held whatever
         // BEGIN left in it — a `received` of zero — for the entire transfer,
@@ -352,6 +389,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
         // A vanished relay must not leave gate sampling paused indefinitely.
         // The inactive partition is disposable; the running slot is untouched.
+        OtaLockGuard lock;
         if (otaState == OTA_STATE_RECEIVING) {
             failOta(OTA_STATE_ERR_SEQ);
             slog::printf("[BLE-OTA] transfer aborted on disconnect");
@@ -418,6 +456,8 @@ ServerCallbacks serverCallbacks;
 }  // namespace
 
 void begin() {
+    otaLock = xSemaphoreCreateMutex();
+
     // init() takes a name because it must set one before the GATT server
     // exists; the address it is built from is only available once init() has
     // synced the host and controller, so the suffixed name is applied
@@ -495,6 +535,24 @@ bool isOtaActive() {
 }
 
 void loopOta() {
+    // A relay that sent BEGIN and then stopped, while staying connected, would
+    // otherwise keep polling paused for as long as the link lasts. Try-lock:
+    // if a GATT callback holds the lock, a frame is being handled right now,
+    // which is progress, and the next pass looks again.
+    bool timedOut = false;
+    if (otaLock && xSemaphoreTake(otaLock, 0) == pdTRUE) {
+        if (otasession::stalled(otaState, otaLastProgressMs, millis())) {
+            failOta(OTA_STATE_ERR_SEQ, /*publish=*/false);
+            timedOut = true;
+        }
+        xSemaphoreGive(otaLock);
+    }
+    if (timedOut) {
+        publishOtaStatus();
+        slog::printf("[BLE-OTA] no data for %lus; transfer aborted\n",
+                     (unsigned long)(otasession::PROGRESS_TIMEOUT_MS / 1000));
+    }
+
     if (otaRebootAt != 0 &&
         static_cast<int32_t>(millis() - otaRebootAt) >= 0) {
         slog::printf("[BLE-OTA] rebooting into updated firmware");

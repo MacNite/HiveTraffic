@@ -459,6 +459,11 @@ No ESP32, no MCP23017 and no bee required.
 * **`include/maint_state.h`** — maintenance sessions: the inactivity timeout,
   the replay of HiveHub's deferred night-mode and bank requests (a suspension
   resumes with only its remaining time), and the monotonic `maint_s` figure.
+* **`include/ota_session.h`** — what each OTA frame may do. The suite pins
+  the stall timeout that hands a relay that went quiet mid-image back to
+  counting (across the `millis()` rollover), and DONE as a terminal state: a
+  repeated END, a stray ABORT or BEGIN, or a late DATA write after a verified
+  image must neither cancel the reboot nor report a failure.
 * **`include/device_name.h`** — the advertised BLE name, `HiveTraffic-AB:12`.
   The suffix is the last two bytes of the counter's own address, and every way
   of getting it wrong produces a name that still looks like a name while
@@ -485,7 +490,7 @@ Easy Bee Counter 2026 — firmware booting (BLE/GATT link)
 [MCP] U2 (gates 00..07) @ 0x20: OK
 [MCP] U3 (gates 10..17) @ 0x21: OK
 [MCP] U4 (gates 20..27) @ 0x22: OK
-[BLE] HiveTraffic-AB:12 0.5.0 advertising for HiveHub
+[BLE] HiveTraffic-AB:12 0.5.1 advertising for HiveHub
 [SETUP] Entering normal counting loop (pulsed IR)
 [CON] USB console ready - type 'help' and Enter
 ```

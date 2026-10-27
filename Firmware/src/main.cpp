@@ -1328,9 +1328,24 @@ void loop() {
         }
     }
 
+    // An OTA that ends without a reboot — aborted, failed, stalled or cut off by
+    // a disconnect — hands the counter back after a pause of any length. The
+    // gates still hold what they saw when it began: a sensor accepted as
+    // blocked then would fail the stuck-sensor check on the very first poll
+    // afterwards (and latch the fault flag until reset), and a half-finished
+    // pairing could combine with a sample taken minutes later. So the first
+    // pass after the pause only resets them, exactly as night mode does on both
+    // of its edges; polling resumes on the next pass from a fresh baseline.
+    static bool ota_paused = false;
     if (ble::isOtaActive()) {
+        ota_paused = true;
         driveIrLeds(false);
         polltiming::pause(g_timing);
+    } else if (ota_paused) {
+        ota_paused = false;
+        resetAllGates();
+        slog::printf("[OTA] transfer ended without an update; gates reset, "
+                     "counting resumes");
     } else if (!idlestate::sensing(g_idle)) {
         // Night mode: emitters dark, gates unpolled, totals frozen.
         //

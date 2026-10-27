@@ -33,7 +33,7 @@ The value is generated when HiveHub reads it, so it contains current lifetime
 totals rather than a periodically cached snapshot:
 
 ```json
-{"fw":6,"ver":"0.5.0","uptime_s":1234,"status":15,"num_gates":24,"mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,"banks":7,"maint_s":0}
+{"fw":6,"ver":"0.5.1","uptime_s":1234,"status":15,"num_gates":24,"mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,"banks":7,"maint_s":0}
 ```
 
 | Field | Type | Meaning |
@@ -393,9 +393,22 @@ merged factory image. `Update.begin()` rejects an image that
 cannot fit the inactive partition.
 
 Gate polling pauses and the emitters remain off during transfer. A disconnect
-aborts the partial write and immediately allows counting to resume. DONE remains
-readable for 1.5 seconds after verification, then the ESP32-C6 reboots. A bad
-size, CRC, interrupted link, or ABORT leaves the running image bootable.
+aborts the partial write and immediately allows counting to resume, and so does
+a transfer that stalls: a connected relay that sends no DATA for 60 seconds
+after BEGIN or after its last write is aborted with `0x11` (`ERR_SEQ`, the same
+code as a dropped link). Counting resumes from a fresh baseline either way — any
+gate state from before the transfer is discarded rather than combined with
+samples taken after it. A bad size, CRC, interrupted link, stall or ABORT
+leaves the running image bootable.
+
+DONE is terminal. It is published once END has verified the image, at which
+point the new slot is already the boot partition; DONE remains readable for 1.5
+seconds, then the ESP32-C6 reboots. Anything a client writes in between — a
+repeated END after a lost write response, an ABORT, a new BEGIN, a late DATA
+write — is ignored and answered with DONE again, so a retried END is
+idempotent. (Before firmware 0.5.1 such a frame cancelled the reboot and
+reported an error while the new image stayed selected, so the counter told
+HiveHub the update had failed and then booted it at its next reset.)
 
 ### The HiveHub relay
 

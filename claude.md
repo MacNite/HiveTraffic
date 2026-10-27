@@ -49,6 +49,8 @@ backend.
   - `include/idle_state.h` — night-mode suspension as pure deadline arithmetic.
   - `include/bank_state.h` — the emitter-bank (MOSFET) enable mask, as pure
     bitmask rules.
+  - `include/ota_session.h` — the OTA frame rules: the stall timeout and DONE
+    as a terminal state.
   - `include/pins.h` — **authoritative** GPIO map for the PCB.
   - `tools/gate_test.py` — guided bench test of all 24 gates over the USB
     console (pyserial). Its tests run a simulated console with the firmware's
