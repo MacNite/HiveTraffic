@@ -49,6 +49,8 @@ backend.
   - `include/idle_state.h` — night-mode suspension as pure deadline arithmetic.
   - `include/bank_state.h` — the emitter-bank (MOSFET) enable mask, as pure
     bitmask rules.
+  - `include/ota_session.h` — the OTA frame rules: the stall timeout and DONE
+    as a terminal state.
   - `include/pins.h` — **authoritative** GPIO map for the PCB.
   - `tools/gate_test.py` — guided bench test of all 24 gates over the USB
     console (pyserial). Its tests run a simulated console with the firmware's
@@ -77,6 +79,11 @@ backend.
   debug image. Never print with `Serial.print*()` — use `slog::printf()`, which
   drops a line rather than stall the 5 ms sampler when the USB host is not
   reading.
+- **`loop()` owns the counter state.** NimBLE callbacks run on the host task,
+  which preempts `loopTask` anywhere on this single-core chip. A GATT callback
+  may read counter state but must never change the gates, emitters, banks,
+  night mode or the maintenance session: control writes are posted to the
+  mailbox in `main.cpp` and applied by `serviceControlRequests()` between polls.
 - **Maintenance mode fails open, like night mode.** The USB console's
   `maint on` freezes the totals and holds HiveHub's requests back, so it must
   always end: 30 min without a command, an OTA, or a reset. Never persist it,
@@ -103,6 +110,11 @@ backend.
   `/SDC` is a typo for SCL, and the `/GPIO4` / `/GPIO5` / `/GPIO6` LED-bank nets
   are just names; the three banks are physically driven from GPIO19, GPIO20 and
   GPIO18 (XIAO silk D8, D9, D10).
+- **GPA7/GPB7 carry sensor inputs (gates 07, 17, 27), against the MCP23017
+  datasheet (rev. D: output-only).** A known hardware design risk, documented
+  in `pins.h` and the README; the firmware only mitigates it (debounce, I²C bus
+  recovery when every expander is lost). Don't remove those mitigations, and
+  flag it whenever the PCB is revised.
 - **Three IR emitter banks, one MOSFET per MCP23017** since the 2026-08 hardware
   revision: bank 1 = gates 00..07 (U2), bank 2 = 10..17 (U3), bank 3 = 20..27
   (U4). Older docs describing a 2-FET split (00..13 / 14..27) are stale.

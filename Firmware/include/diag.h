@@ -62,7 +62,7 @@ struct ChipView {
 };
 
 struct StatusView {
-    uint32_t uptime_ms = 0;
+    uint32_t uptime_s = 0;
     uint32_t total_in = 0;
     uint32_t total_out = 0;
     uint32_t glitches = 0;

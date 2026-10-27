@@ -33,7 +33,7 @@ The value is generated when HiveHub reads it, so it contains current lifetime
 totals rather than a periodically cached snapshot:
 
 ```json
-{"fw":6,"ver":"0.5.0","uptime_s":1234,"status":15,"num_gates":24,"mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,"banks":7,"maint_s":0}
+{"fw":6,"ver":"0.5.1","uptime_s":1234,"status":15,"num_gates":24,"mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,"banks":7,"maint_s":0}
 ```
 
 | Field | Type | Meaning |
@@ -130,11 +130,13 @@ glitches than it did on the previous read, and the 16-bit ceiling it used to pin
 at is reachable in a day on a genuinely noisy device.
 
 `uptime_s` is seconds since boot, and its only real job is to show that the
-device restarted when you did not expect it to. It is 32-bit; the practical
-limit is not the field but `millis()`, which rolls over after about 49.7 days,
-so the value restarts then too. (Before protocol v3 the field was 16-bit and
-clamped at 65535 — 18 h 12 min — which meant an always-on counter reported one
-constant number for its entire deployment and could not do that job at all.)
+device restarted when you did not expect it to. It is 32-bit (about 136 years)
+and, since firmware 0.5.1, comes from the 64-bit `esp_timer` clock, so it goes
+back only on a real reset. (Before 0.5.1 it was derived from `millis()` and
+restarted every ~49.7 days on a counter that never rebooted. Before protocol v3
+the field was 16-bit and clamped at 65535 — 18 h 12 min — which meant an
+always-on counter reported one constant number for its entire deployment and
+could not do that job at all.)
 
 `mcps_healthy` counts the MCP23017 expanders currently answering on the I2C bus,
 so it ranges 0..3 while `num_gates` is 24; each healthy chip covers eight gates.
@@ -393,9 +395,22 @@ merged factory image. `Update.begin()` rejects an image that
 cannot fit the inactive partition.
 
 Gate polling pauses and the emitters remain off during transfer. A disconnect
-aborts the partial write and immediately allows counting to resume. DONE remains
-readable for 1.5 seconds after verification, then the ESP32-C6 reboots. A bad
-size, CRC, interrupted link, or ABORT leaves the running image bootable.
+aborts the partial write and immediately allows counting to resume, and so does
+a transfer that stalls: a connected relay that sends no DATA for 60 seconds
+after BEGIN or after its last write is aborted with `0x11` (`ERR_SEQ`, the same
+code as a dropped link). Counting resumes from a fresh baseline either way — any
+gate state from before the transfer is discarded rather than combined with
+samples taken after it. A bad size, CRC, interrupted link, stall or ABORT
+leaves the running image bootable.
+
+DONE is terminal. It is published once END has verified the image, at which
+point the new slot is already the boot partition; DONE remains readable for 1.5
+seconds, then the ESP32-C6 reboots. Anything a client writes in between — a
+repeated END after a lost write response, an ABORT, a new BEGIN, a late DATA
+write — is ignored and answered with DONE again, so a retried END is
+idempotent. (Before firmware 0.5.1 such a frame cancelled the reboot and
+reported an error while the new image stayed selected, so the counter told
+HiveHub the update had failed and then booted it at its next reset.)
 
 ### The HiveHub relay
 

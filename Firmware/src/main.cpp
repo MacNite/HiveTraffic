@@ -89,7 +89,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_MCP23X17.h>
+#include <esp_timer.h>
 
 #include "pins.h"
 #include "counter_protocol.h"
@@ -298,15 +298,27 @@ static constexpr uint8_t MCP_FAIL_THRESHOLD = 3;
 // before the emitters are lit so a failed probe never extends the LED pulse.
 static constexpr uint32_t MCP_RETRY_INTERVAL_MS = 5000;
 
-// MCP23017 register address of GPIOA with IOCON.BANK=0 (the power-on default,
-// which the Adafruit driver leaves alone). GPIOB follows at 0x13 and the chip's
-// sequential-read mode returns both from one 2-byte read — the same access
-// readGPIOAB() performs, but issued directly so the I2C transaction result is
-// actually visible to us. readGPIOAB() returns a bare uint16_t and reports a
-// failed bus transaction as 0x0000, i.e. as "all sensors blocked".
+// MCP23017 register addresses with IOCON.BANK = 0, the power-on default and the
+// value initMcp() writes. GPIOB follows GPIOA at 0x13 and the chip's
+// sequential-read mode returns both from one 2-byte read, issued directly so
+// the I2C transaction result is visible: a driver call that returns a bare
+// uint16_t reports a failed bus transaction as 0x0000, i.e. as "all sensors
+// blocked". IODIRA..GPPUB are 0x00..0x0D, so one 14-byte read covers every
+// configuration register.
+//
+// The chips are driven with plain Wire transactions throughout. (The Adafruit
+// driver used to be called once per chip at boot and again on every recovery,
+// and its begin_I2C() allocates a new bus object each time without freeing the
+// last — a chip that kept dropping out leaked heap at every return.)
 static constexpr uint8_t MCP23X17_REG_GPIOA = 0x12;
-
-static Adafruit_MCP23X17 g_mcp_dev[NUM_MCP];
+static constexpr uint8_t MCP_REG_IODIRA = 0x00;
+static constexpr uint8_t MCP_REG_IODIRB = 0x01;
+static constexpr uint8_t MCP_REG_IPOLA  = 0x02;
+static constexpr uint8_t MCP_REG_IPOLB  = 0x03;
+static constexpr uint8_t MCP_REG_IOCON  = 0x0A;
+static constexpr uint8_t MCP_REG_GPPUA  = 0x0C;
+static constexpr uint8_t MCP_REG_GPPUB  = 0x0D;
+static constexpr uint8_t MCP_CONFIG_BYTES = 14;
 
 // Read statistics for the diagnostic console's `mcp` command. Counted by the
 // normal sampler as it goes; nothing extra is read to produce them. All
@@ -373,6 +385,14 @@ static volatile LedMode g_led_mode = LedMode::AUTO;
 // Low-level helpers
 // ============================================================================
 
+// Seconds since boot, from the 64-bit microsecond timer. millis() is 32-bit and
+// wraps after ~49.7 days, which made uptime restart on a counter that never
+// rebooted — and uptime restarting is exactly what is supposed to mean a
+// reboot. The 32-bit second count this returns lasts ~136 years.
+static uint32_t uptimeSeconds() {
+    return (uint32_t)(esp_timer_get_time() / 1000000LL);
+}
+
 // Drive every emitter-bank MOSFET to the same state and update the status bit.
 // This is the raw control used by FORCE_ON/FORCE_OFF and by the pulsed sampler.
 // It does NOT consult g_led_mode (the caller decides), so the pulsed sampler
@@ -409,17 +429,60 @@ static void setIrLeds(bool on) {
 // MCP23017 acquisition + health
 // ============================================================================
 
-static bool initMcp(Adafruit_MCP23X17& mcp, uint8_t addr, const char* tag,
-                    bool quiet = false) {
-    if (!mcp.begin_I2C(addr, &Wire)) {
+static bool writeMcpReg(uint8_t addr, uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+// Read IODIRA..GPPUB in one sequential read.
+static bool readMcpConfig(uint8_t addr, uint8_t (&r)[MCP_CONFIG_BYTES]) {
+    Wire.beginTransmission(addr);
+    Wire.write(MCP_REG_IODIRA);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((int)addr, (int)MCP_CONFIG_BYTES) != MCP_CONFIG_BYTES) {
+        return false;
+    }
+    for (uint8_t k = 0; k < MCP_CONFIG_BYTES; k++) r[k] = (uint8_t)Wire.read();
+    return true;
+}
+
+static bool mcpConfigMatches(const uint8_t (&r)[MCP_CONFIG_BYTES]) {
+    return diagfmt::mcpConfigOk(r[MCP_REG_IODIRA], r[MCP_REG_IODIRB],
+                                r[MCP_REG_IPOLA], r[MCP_REG_IPOLB],
+                                r[MCP_REG_GPPUA], r[MCP_REG_GPPUB],
+                                r[MCP_REG_IOCON]);
+}
+
+// Put a chip into the configuration the sampler relies on, then read it back.
+// An ACK only proves that something answers at the address; a chip is trusted
+// only once its registers say what was written.
+//
+// All 16 pins are sensor inputs. The board provides 100k pull-ups, so the
+// MCP's weak internal pull-ups stay off. IOCON goes first: BANK = 0 fixes the
+// register map everything here addresses, SEQOP = 0 the sequential reads the
+// sampler and the read-back depend on. Each register is written on its own so
+// none of this assumes SEQOP before it is set.
+static bool initMcp(uint8_t addr, const char* tag, bool quiet = false) {
+    const bool written =
+        writeMcpReg(addr, MCP_REG_IOCON, 0x00) &&
+        writeMcpReg(addr, MCP_REG_IODIRA, 0xFF) &&
+        writeMcpReg(addr, MCP_REG_IODIRB, 0xFF) &&
+        writeMcpReg(addr, MCP_REG_IPOLA, 0x00) &&
+        writeMcpReg(addr, MCP_REG_IPOLB, 0x00) &&
+        writeMcpReg(addr, MCP_REG_GPPUA, 0x00) &&
+        writeMcpReg(addr, MCP_REG_GPPUB, 0x00);
+    uint8_t r[MCP_CONFIG_BYTES] = {0};
+    if (!written) {
         if (!quiet) slog::printf("[MCP] %s @ 0x%02X: NOT FOUND\n", tag, addr);
         return false;
     }
-    // All 16 pins are sensor inputs. The board provides 100k pull-ups, so we
-    // use plain INPUT (not INPUT_PULLUP) to keep the MCP's weak internal
-    // pull-ups out of the picture.
-    for (uint8_t p = 0; p < 16; p++) {
-        mcp.pinMode(p, INPUT);
+    if (!readMcpConfig(addr, r) || !mcpConfigMatches(r)) {
+        if (!quiet) {
+            slog::printf("[MCP] %s @ 0x%02X: configuration not confirmed\n", tag, addr);
+        }
+        return false;
     }
     if (!quiet) slog::printf("[MCP] %s @ 0x%02X: OK\n", tag, addr);
     return true;
@@ -518,6 +581,63 @@ static bool mcpPresent(uint8_t addr) {
     return Wire.endTransmission() == 0;
 }
 
+// The standard I2C bus clear, for a slave left holding SDA low part-way through
+// a byte: clock SCL until SDA is released (nine pulses finish any byte), send a
+// STOP, and hand the pins back to the controller. The datasheet's warning about
+// GPA7/GPB7 inputs (see pins.h) is exactly this kind of SDA disruption, and a
+// wedged bus would otherwise keep all 24 gates dark until a power cycle.
+// Takes ~150 us with the emitters dark.
+static void recoverI2cBus() {
+    Wire.end();
+    pinMode(pins::I2C_SDA, INPUT_PULLUP);
+    pinMode(pins::I2C_SCL, OUTPUT_OPEN_DRAIN);
+    digitalWrite(pins::I2C_SCL, HIGH);
+    delayMicroseconds(5);
+    for (uint8_t i = 0; i < 9 && digitalRead(pins::I2C_SDA) == LOW; i++) {
+        digitalWrite(pins::I2C_SCL, LOW);
+        delayMicroseconds(5);
+        digitalWrite(pins::I2C_SCL, HIGH);
+        delayMicroseconds(5);
+    }
+    // STOP: SDA low while SCL is low, then release SCL, then SDA.
+    digitalWrite(pins::I2C_SCL, LOW);
+    delayMicroseconds(5);
+    pinMode(pins::I2C_SDA, OUTPUT_OPEN_DRAIN);
+    digitalWrite(pins::I2C_SDA, LOW);
+    delayMicroseconds(5);
+    digitalWrite(pins::I2C_SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(pins::I2C_SDA, HIGH);
+    delayMicroseconds(5);
+    Wire.begin(pins::I2C_SDA, pins::I2C_SCL, (uint32_t)I2C_MASTER_HZ);
+}
+
+// When every expander is lost at once, the likely fault is the shared bus, not
+// three chips. Clear it then, and again once per MCP_RETRY_INTERVAL_MS for as
+// long as the outage lasts, so each round of re-probes runs on a freed bus.
+// A single chip that still answers proves the bus works, and nothing happens.
+static bool     g_bus_outage = false;
+static uint32_t g_bus_recover_at_ms = 0;
+
+static void serviceBusRecovery(uint32_t now_ms) {
+    bool all_lost = true;
+    for (uint8_t i = 0; i < NUM_MCP; i++) {
+        if (g_mcp[i].ok) all_lost = false;
+    }
+    if (!all_lost) {
+        g_bus_outage = false;
+        return;
+    }
+    if (!g_bus_outage) {
+        g_bus_outage = true;
+        g_bus_recover_at_ms = now_ms;
+        slog::printf("[MCP] no expander answering; bus recovery before each re-probe");
+    }
+    if ((int32_t)(now_ms - g_bus_recover_at_ms) < 0) return;
+    g_bus_recover_at_ms = now_ms + MCP_RETRY_INTERVAL_MS;
+    recoverI2cBus();
+}
+
 // Re-probe an unhealthy chip, at most once per MCP_RETRY_INTERVAL_MS. Runs with
 // the emitters dark, before the sampling window.
 static void retryMcp(uint8_t idx, uint32_t now_ms) {
@@ -526,15 +646,13 @@ static void retryMcp(uint8_t idx, uint32_t now_ms) {
     if ((int32_t)(now_ms - m.next_retry_ms) < 0) return;
     m.next_retry_ms = now_ms + MCP_RETRY_INTERVAL_MS;
 
-    // Cheap ACK probe first, so the full re-init only runs when the chip is
-    // genuinely back. begin_I2C() reallocates the driver's bus object; gating
-    // it on presence keeps a permanently absent chip from churning that
-    // allocation every retry for the life of the device.
+    // Cheap ACK probe first, so the configure-and-verify only runs when the
+    // chip is genuinely back.
     if (!mcpPresent(m.addr)) return;
 
     // quiet: a chip that ACKs but fails to configure would otherwise log on
-    // every retry.
-    if (!initMcp(g_mcp_dev[idx], m.addr, m.tag, /*quiet=*/true)) return;
+    // every retry. It stays unhealthy until its registers read back right.
+    if (!initMcp(m.addr, m.tag, /*quiet=*/true)) return;
 
     m.ok = true;
     m.fail_streak = 0;
@@ -626,6 +744,7 @@ static bool pollAllGates() {
 
     // Re-probe anything currently marked unhealthy. Done first, with the
     // emitters still dark, so a probe never lengthens the LED pulse.
+    serviceBusRecovery(now_ms);
     for (uint8_t i = 0; i < NUM_MCP; i++) {
         retryMcp(i, now_ms);
     }
@@ -742,16 +861,37 @@ static bool pollAllGates() {
 // ----------------------------------------------------------------------------
 // BLE transport callbacks (defined here because the counter state lives in this
 // translation unit). ble_link.cpp drives the GATT server and calls into these.
+//
+// They run on the NimBLE host task, which on this single-core chip outranks
+// loopTask and can preempt it anywhere — in the middle of a lit sampling
+// window, half-way through one gate's state update, or between a read and a
+// write of g_status_flags. So nothing here changes counter state. The
+// telemetry and read-back calls only read it; the two control writes are
+// posted to a mailbox that loop() applies between polls (see
+// serviceControlRequests() below), which makes loop() the one owner of the
+// gates, the banks, night mode and the maintenance session.
 // ----------------------------------------------------------------------------
+
+// Control writes waiting for loop(). Latest wins within each kind, which is
+// what both mean: a RESUME after a SET_IDLE in the same instant is a resume,
+// and of two masks the second is the one HiveHub wants. Guarded by a critical
+// section rather than a mutex because it is held for a few word copies.
+struct ControlMailbox {
+    bool     idle_pending = false;
+    uint32_t idle_s = 0;
+    bool     banks_pending = false;
+    uint8_t  banks = 0;
+};
+static ControlMailbox g_ctrl_mailbox;
+static portMUX_TYPE g_ctrl_mux = portMUX_INITIALIZER_UNLOCKED;
+
 namespace ble {
 
 void getTelemetry(Telemetry& t) {
     // No clamp since protocol v3: uptime_s is a uint32_t on both sides of the
-    // link. millis() itself rolls over at ~49.7 days, so this still restarts
-    // then — the field reports time since the last millis() epoch, which is
-    // what an unexpected reset shows up in. (A 32-bit second counter would run
-    // ~136 years; the rollover, not the width, is now the limit.)
-    const uint32_t up = millis() / 1000;
+    // link, and since 0.5.1 it no longer restarts with the millis() rollover
+    // either (see uptimeSeconds()), so it only ever goes back on a real reset.
+    const uint32_t up = uptimeSeconds();
     // Live health, not the boot-time snapshot this used to report: a chip that
     // died after setup() now shows up here (and in the STATUS_MCP_U*_OK bits),
     // and one that recovers is counted again.
@@ -791,9 +931,10 @@ void getTelemetry(Telemetry& t) {
 
 }  // namespace ble
 
-// Apply a night-mode request immediately. ble::applyIdleRequest() below is the
-// HiveHub entry point and defers to this outside maintenance; ending a
-// maintenance session replays a deferred request through it.
+// Apply a night-mode request immediately. HiveHub's requests reach it through
+// handleIdleRequest() below, outside maintenance; ending a maintenance session
+// replays a deferred request through it. loop() only, like everything that
+// changes the gates or the emitters.
 static uint32_t applyIdleNow(uint32_t duration_s) {
     const bool was_sensing = idlestate::sensing(g_idle);
     const idlestate::Request r =
@@ -823,6 +964,7 @@ static uint32_t applyIdleNow(uint32_t duration_s) {
 
 // Apply a bank mask immediately; the same split as applyIdleNow().
 static uint8_t applyBankMaskNow(uint8_t mask) {
+    const uint8_t before = g_banks.mask;
     const bankstate::Request r = bankstate::request(g_banks, mask);
     if (!r.accepted) {
         // bank_state.h refuses an all-off mask rather than blinding the
@@ -836,8 +978,10 @@ static uint8_t applyBankMaskNow(uint8_t mask) {
         // Both edges matter. A bank going dark leaves any half-finished
         // pairing on its gates unfinishable; a bank coming back would otherwise
         // combine a pairing from before the gap with a sample from after it.
+        // A bank whose state did not change is left alone: switching bank 3
+        // off must not throw away a crossing in progress on bank 1.
         for (uint8_t b = 1; b <= pins::NUM_LED_BANKS; b++) {
-            resetGatesForBank(b);
+            if ((before ^ g_banks.mask) & bankstate::bankBit(b)) resetGatesForBank(b);
         }
         // Park the FETs on the new mask immediately rather than waiting for the
         // next poll — drawing the current is the whole thing being switched off.
@@ -851,18 +995,64 @@ static uint8_t applyBankMaskNow(uint8_t mask) {
     return r.granted;
 }
 
-namespace ble {
-
-uint32_t applyIdleRequest(uint32_t duration_s) {
-    if (!g_maint.active) return applyIdleNow(duration_s);
-    // Maintenance owns the emitters until it ends. Hold the request — clamped
-    // exactly as it would have been — and replay what is left of it then, so
-    // the counter still ends up where HiveHub wants it.
+// Apply a HiveHub night-mode request. Outside maintenance it takes effect at
+// once; maintenance owns the emitters until it ends, so the request is held —
+// clamped exactly as it would have been — and what is left of it is replayed
+// then, so the counter still ends up where HiveHub wants it. loop() only.
+static void handleIdleRequest(uint32_t duration_s) {
+    if (!g_maint.active) {
+        applyIdleNow(duration_s);
+        return;
+    }
     idlestate::State probe;
     const uint32_t granted = idlestate::request(probe, millis(), duration_s).granted_s;
     maintstate::deferIdle(g_maint, millis(), granted);
     slog::printf("[MAINT] HiveHub night mode %lus held until maintenance ends",
                  (unsigned long)granted);
+}
+
+// The same for a bank mask, validated by the same rules (an all-off mask is
+// still refused) and then held like a night-mode request. loop() only.
+static void handleBankRequest(uint8_t mask) {
+    if (!g_maint.active) {
+        applyBankMaskNow(mask);
+        return;
+    }
+    bankstate::State probe = g_banks;
+    const bankstate::Request r = bankstate::request(probe, mask);
+    if (!r.accepted) {
+        slog::printf("[BANKS] request 0x%02X refused; still 0x%02X",
+                     (unsigned)mask, (unsigned)g_banks.mask);
+        return;
+    }
+    maintstate::deferBanks(g_maint, r.granted);
+    slog::printf("[MAINT] HiveHub bank mask 0x%02X held until maintenance ends",
+                 (unsigned)r.granted);
+}
+
+// Apply whatever the control characteristic posted since the last pass. Called
+// at the top of loop(), so a request always lands between two polls.
+static void serviceControlRequests() {
+    portENTER_CRITICAL(&g_ctrl_mux);
+    const ControlMailbox m = g_ctrl_mailbox;
+    g_ctrl_mailbox = ControlMailbox();
+    portEXIT_CRITICAL(&g_ctrl_mux);
+
+    if (m.banks_pending) handleBankRequest(m.banks);
+    if (m.idle_pending) handleIdleRequest(m.idle_s);
+}
+
+namespace ble {
+
+// The return values are what the request WILL do, worked out on copies by the
+// same pure rules loop() applies, so ble_link.cpp can log and answer at once.
+uint32_t applyIdleRequest(uint32_t duration_s) {
+    idlestate::State probe;
+    const uint32_t granted = idlestate::request(probe, millis(), duration_s).granted_s;
+    portENTER_CRITICAL(&g_ctrl_mux);
+    g_ctrl_mailbox.idle_pending = true;
+    g_ctrl_mailbox.idle_s = duration_s;
+    portEXIT_CRITICAL(&g_ctrl_mux);
     return granted;
 }
 
@@ -871,20 +1061,15 @@ uint32_t idleRemainingSeconds() {
 }
 
 uint8_t applyBankMask(uint8_t mask) {
-    if (!g_maint.active) return applyBankMaskNow(mask);
-    // Validated by the same rules (an all-off mask is still refused), then
-    // held like a night-mode request.
     bankstate::State probe = g_banks;
     const bankstate::Request r = bankstate::request(probe, mask);
-    if (!r.accepted) {
-        slog::printf("[BANKS] request 0x%02X refused; still 0x%02X",
-                     (unsigned)mask, (unsigned)g_banks.mask);
-        return g_banks.mask;
-    }
-    maintstate::deferBanks(g_maint, r.granted);
-    slog::printf("[MAINT] HiveHub bank mask 0x%02X held until maintenance ends",
-                 (unsigned)r.granted);
-    return r.granted;
+    // A refused mask is still posted, so loop() logs the refusal where it
+    // logs everything else about the banks; it changes nothing there either.
+    portENTER_CRITICAL(&g_ctrl_mux);
+    g_ctrl_mailbox.banks_pending = true;
+    g_ctrl_mailbox.banks = mask;
+    portEXIT_CRITICAL(&g_ctrl_mux);
+    return r.accepted ? r.granted : g_banks.mask;
 }
 
 uint8_t bankMask() {
@@ -1012,7 +1197,7 @@ void chipView(uint8_t chip, ChipView& out) {
 void statusView(StatusView& out) {
     out = StatusView();
     const uint32_t now = millis();
-    out.uptime_ms = now;
+    out.uptime_s = uptimeSeconds();
     out.total_in = g_total_in;
     out.total_out = g_total_out;
     out.glitches = g_glitch_count;
@@ -1135,10 +1320,6 @@ Result i2cScan(I2cScanView& out) {
     return Result::OK;
 }
 
-// MCP23017 register addresses with IOCON.BANK = 0. IODIRA..GPPUB are 0x00..0x0D,
-// so one sequential 14-byte read covers every configuration register.
-static constexpr uint8_t MCP_REG_IODIRA = 0x00;
-static constexpr uint8_t MCP_CONFIG_BYTES = 14;
 static constexpr uint16_t MCP_TEST_BURST = 100;
 
 Result mcpTest(McpTestView (&out)[NUM_CHIPS]) {
@@ -1154,22 +1335,16 @@ Result mcpTest(McpTestView (&out)[NUM_CHIPS]) {
         if (!v.present) continue;
 
         uint8_t r[MCP_CONFIG_BYTES] = {0};
-        Wire.beginTransmission(m.addr);
-        Wire.write(MCP_REG_IODIRA);
-        if (Wire.endTransmission(false) == 0 &&
-            Wire.requestFrom((int)m.addr, (int)MCP_CONFIG_BYTES) == MCP_CONFIG_BYTES) {
-            for (uint8_t k = 0; k < MCP_CONFIG_BYTES; k++) r[k] = (uint8_t)Wire.read();
+        if (readMcpConfig(m.addr, r)) {
             v.regs_read = true;
-            v.iodir_a = r[0x00];
-            v.iodir_b = r[0x01];
-            v.ipol_a  = r[0x02];
-            v.ipol_b  = r[0x03];
-            v.iocon   = r[0x0A];
-            v.gppu_a  = r[0x0C];
-            v.gppu_b  = r[0x0D];
-            v.config_ok = diagfmt::mcpConfigOk(v.iodir_a, v.iodir_b, v.ipol_a,
-                                               v.ipol_b, v.gppu_a, v.gppu_b,
-                                               v.iocon);
+            v.iodir_a = r[MCP_REG_IODIRA];
+            v.iodir_b = r[MCP_REG_IODIRB];
+            v.ipol_a  = r[MCP_REG_IPOLA];
+            v.ipol_b  = r[MCP_REG_IPOLB];
+            v.iocon   = r[MCP_REG_IOCON];
+            v.gppu_a  = r[MCP_REG_GPPUA];
+            v.gppu_b  = r[MCP_REG_GPPUB];
+            v.config_ok = mcpConfigMatches(r);
         }
 
         // The same checked two-byte read the sampler does, back to back. Its
@@ -1262,7 +1437,7 @@ void setup() {
     // is left unhealthy, its gates are skipped, and pollAllGates() re-probes it
     // every MCP_RETRY_INTERVAL_MS until it answers.
     for (uint8_t i = 0; i < NUM_MCP; i++) {
-        g_mcp[i].ok = initMcp(g_mcp_dev[i], g_mcp[i].addr, g_mcp[i].tag);
+        g_mcp[i].ok = initMcp(g_mcp[i].addr, g_mcp[i].tag);
         g_mcp[i].fail_streak = 0;
         if (g_mcp[i].ok) {
             g_status_flags |= g_mcp[i].status_bit;
@@ -1298,6 +1473,11 @@ void loop() {
     // Services the deferred post-OTA reboot, once the central has had a chance
     // to read DONE off the status characteristic.
     ble::loopOta();
+    ble::serviceAdvertising();
+
+    // Night-mode and bank writes from HiveHub, applied here between polls
+    // rather than on the NimBLE task that received them.
+    serviceControlRequests();
 
     const uint32_t now = millis();
 
@@ -1328,9 +1508,24 @@ void loop() {
         }
     }
 
+    // An OTA that ends without a reboot — aborted, failed, stalled or cut off by
+    // a disconnect — hands the counter back after a pause of any length. The
+    // gates still hold what they saw when it began: a sensor accepted as
+    // blocked then would fail the stuck-sensor check on the very first poll
+    // afterwards (and latch the fault flag until reset), and a half-finished
+    // pairing could combine with a sample taken minutes later. So the first
+    // pass after the pause only resets them, exactly as night mode does on both
+    // of its edges; polling resumes on the next pass from a fresh baseline.
+    static bool ota_paused = false;
     if (ble::isOtaActive()) {
+        ota_paused = true;
         driveIrLeds(false);
         polltiming::pause(g_timing);
+    } else if (ota_paused) {
+        ota_paused = false;
+        resetAllGates();
+        slog::printf("[OTA] transfer ended without an update; gates reset, "
+                     "counting resumes");
     } else if (!idlestate::sensing(g_idle)) {
         // Night mode: emitters dark, gates unpolled, totals frozen.
         //
@@ -1381,7 +1576,7 @@ void loop() {
         slog::printf(
             "[STAT] uptime=%lus total_in=%lu total_out=%lu "
             "glitches=%lu status=0x%02X idle=%lus banks=0x%02X\n",
-            (unsigned long)(now / 1000),
+            (unsigned long)uptimeSeconds(),
             (unsigned long)g_total_in,
             (unsigned long)g_total_out,
             (unsigned long)g_glitch_count,

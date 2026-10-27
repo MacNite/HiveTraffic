@@ -158,6 +158,29 @@ is optional — see the note in Section 1.
 > per-chip pin→gate map clean; there are 24 physical gates indexed 0..23
 > internally.
 
+> **Known design risk: GPA7 and GPB7 are used as inputs.** Since revision D of
+> the MCP23017 datasheet (DS20001952D, 2022), Microchip specifies GPA7 and GPB7
+> as **output-only**: an input on either pin that changes level while the chip
+> is being read can corrupt SDA and disrupt the bus. On this board they carry
+> the inner and outer sensors of gates 07, 17 and 27, which change level
+> whenever a bee passes, at any moment relative to the 5 ms reads. No failure
+> has been observed, and many designs use these pins as inputs without trouble,
+> but it is outside the part's specification.
+>
+> The firmware limits the damage it can do. A single corrupted read cannot
+> count a bee, because the debounce needs two agreeing samples. If the bus
+> locks up, every chip fails its reads and is declared lost, and the firmware
+> then clocks the bus free (nine SCL pulses and a STOP) before each re-probe;
+> `[MCP] no expander answering; bus recovery before each re-probe` in the log
+> says it happened. Neither can make the pins in-spec. That needs a board change, for example moving those six sensors to
+> a different expander (the SPI MCP23S17 is not affected; a 16-bit I²C
+> expander specified for inputs on every pin, such as the TCA9555, is another
+> option), or using 7 gates per chip. Until then, run the
+> bench test (`docs/bench-test.md`) on gates 07, 17 and 27 like any other and
+> treat unexplained `mcps_healthy` drops, `lost`/`recovered` counts in the
+> console's `mcp` view or glitches concentrated on those gates as a sign of
+> this.
+
 ### 3.3 IR Sensor Wiring (per sensor pair, 24× repeated)
 
 Each gate has 2 sensors — one "inner" (towards hive), one "outer" (towards field).
@@ -355,12 +378,15 @@ GATT contract lives in [`docs/ble-mode.md`](docs/ble-mode.md); this is a summary
 - The measurement value is built on read, so it is never a stale snapshot:
 
 ```json
-{"fw":4,"ver":"0.2.0","uptime_s":1234,"status":15,"num_gates":24,
- "mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0}
+{"fw":6,"ver":"0.5.1","uptime_s":1234,"status":15,"num_gates":24,
+ "mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,
+ "banks":7,"maint_s":0}
 ```
 
 `mcps_healthy` counts MCP23017 port expanders (0..3), not gates — each covers
-eight of the 24. `idle_s` is the night-mode countdown, `0` while counting. `fw`
+eight of the 24. `idle_s` is the night-mode countdown, `0` while counting.
+`banks` is the enabled emitter-bank mask (`7` = all three) and `maint_s` the
+lifetime seconds spent in USB maintenance sessions. `fw`
 is the wire format's revision, not the image version (`ver`); see
 [docs/ble-mode.md](docs/ble-mode.md) for the revision history and the deployment
 order it requires.
