@@ -10,6 +10,7 @@ other fails here first.
 """
 
 import os
+import re
 import sys
 import threading
 import time
@@ -32,11 +33,26 @@ class FakeCounter(object):
         'dead_inner' the inner sensor never responds
         'reversed'   inner and outer are swapped (direction counts backwards)
         'ambient'    the inner sensor reads LOW even dark (sunlight)
+        'double'     one pass through the gate counts twice
+        'gap'        the event stream skips a sequence number mid-check
+        'crosstalk'  the neighbouring gate also blocks on the inner check
+        'break'      the person leaves at the OUTSIDE -> INSIDE prompt for so
+                     long that the maintenance session times out
+        'ota'        an OTA ends the session in the middle of the bee_in check
+
+    `chips` maps a chip name to 'absent' or 'bad_config'. `mute` lists
+    commands the counter echoes but never completes.
+
+    Crossings read while no session is running are what the real firmware
+    would add to its lifetime totals; they are counted in `lifetime`.
     """
 
-    def __init__(self, behaviour=None, maint_supported=True):
+    def __init__(self, behaviour=None, maint_supported=True, chips=None, mute=()):
         self.behaviour = behaviour or {}
         self.maint_supported = maint_supported
+        self.chips = chips or {}
+        self.mute = set(mute)
+        self.lifetime = 0
         self.maint = False
         self.events_on = False
         self.target = None          # gate the person is holding a target over
@@ -54,6 +70,8 @@ class FakeCounter(object):
                 for i, (t, line) in enumerate(self._out):
                     if t <= now:
                         del self._out[i]
+                        if not self.maint and re.search(r"ev=bee_(in|out)", line):
+                            self.lifetime += 1
                         return (line + "\n").encode()
             time.sleep(0.002)
         return b""
@@ -68,7 +86,8 @@ class FakeCounter(object):
         with self._lock:
             self._out.append((time.monotonic() + delay, line))
 
-    def _ev(self, gate, kind, delay):
+    def _ev(self, gate, kind, delay, skip=0):
+        self.seq += skip
         if self.events_on:
             self._emit("[EV] seq=%d t=%d gate=%s ev=%s" % (self.seq, self.seq * 10, gate, kind),
                        delay)
@@ -79,6 +98,8 @@ class FakeCounter(object):
 
     def _command(self, cmd):
         self._emit("[CON] > " + cmd)
+        if cmd in self.mute:
+            return
         if cmd == "maint":
             self._emit("[MAINT] on for 3s, ends itself in 1797s without a command"
                        if self.maint else "[MAINT] off; lifetime maintenance 0s")
@@ -91,6 +112,9 @@ class FakeCounter(object):
                        "ends after 1800s without a command")
             self._emit("[MAINT] on for 0s, ends itself in 1800s without a command")
         elif cmd == "maint off":
+            if not self.maint:
+                self._emit("[CON] maint off: nothing to do")
+                return
             self.maint = False
             self._emit("[MAINT] ended on request after 9s: test in=0 out=0 glitches=0; "
                        "banks 0x07, night mode 0s")
@@ -106,8 +130,14 @@ class FakeCounter(object):
                 self._emit("[I2C] ack at 0x%02X" % a)
         elif cmd == "mcp test":
             for name, addr in (("U2", 0x20), ("U3", 0x21), ("U4", 0x22)):
-                self._emit("[MCPTEST] %s 0x%02X: config ok iodir=FF/FF ipol=00/00 "
-                           "gppu=00/00 iocon=00" % (name, addr))
+                chip = self.chips.get(name)
+                if chip == "absent":
+                    self._emit("[MCPTEST] %s 0x%02X: FAIL no ACK on its address" % (name, addr))
+                    continue
+                self._emit("[MCPTEST] %s 0x%02X: config %s iodir=FF/FF ipol=00/00 "
+                           "gppu=%s/00 iocon=00"
+                           % (name, addr, "FAIL" if chip == "bad_config" else "ok",
+                              "FF" if chip == "bad_config" else "00"))
                 self._emit("[MCPTEST] %s burst ok: 100/100 ok nack=0 short=0 max=180us" % name)
         elif cmd == "darklit":
             self._emit("[DARKLIT] inner/outer = dark/lit -> verdict "
@@ -137,6 +167,9 @@ class FakeCounter(object):
             if kind != "dead_inner":
                 s = "outer" if kind == "reversed" else "inner"
                 self._ev(gate, s + "_block", d)
+                if kind == "crosstalk":
+                    nxt = gt.GATE_TAGS[gt.GATE_TAGS.index(gate) + 1]
+                    self._ev(nxt, "inner_block", d)
                 self._ev(gate, s + "_clear", 2 * d)
         elif "over the OUTER" in prompt:
             s = "inner" if kind == "reversed" else "outer"
@@ -147,7 +180,27 @@ class FakeCounter(object):
         elif "take the target away" in prompt:
             self.target = None
         elif "OUTSIDE to INSIDE" in prompt:
-            if kind == "dead_inner":
+            if kind == "break":
+                # Thirty minutes at the prompt: the firmware ends the session.
+                self.maint = False
+                self._emit("[MAINT] ended after inactivity timeout after 1800s: "
+                           "test in=0 out=0 glitches=0; banks 0x07, night mode 0s")
+                self._ev(gate, "bee_in", d)
+            elif kind == "ota":
+                self._ev(gate, "bee_in", d)
+                self._emit("[MAINT] ended for a firmware update after 5s: test in=1 "
+                           "out=0 glitches=0; banks 0x07, night mode 0s", 1.5 * d)
+
+                def end():
+                    self.maint = False
+                threading.Timer(1.5 * d, end).start()
+            elif kind == "double":
+                self._ev(gate, "bee_in", d)
+                self._ev(gate, "bee_in", 2 * d)
+            elif kind == "gap":
+                self._ev(gate, "outer_block", d)
+                self._ev(gate, "bee_in", 2 * d, skip=1)   # one event lost between
+            elif kind == "dead_inner":
                 self._ev(gate, "outer_block", d)
                 self._ev(gate, "outer_clear", 2 * d)
                 self._ev(gate, "glitch", 2 * d)
@@ -239,6 +292,20 @@ class EvalTests(unittest.TestCase):
         # A crossing on another gate is not this gate's.
         self.assertEqual(gt.eval_direction([E(1, 0, "GATE_06", "bee_in")], "GATE_05", "bee_in")[0], gt.FAIL)
 
+    def test_direction_counts_once(self):
+        E = self.E
+        r, note = gt.eval_direction([E(1, 0, "GATE_05", "bee_in"), E(2, 9, "GATE_05", "bee_in")],
+                                    "GATE_05", "bee_in")
+        self.assertEqual(r, gt.FAIL)
+        self.assertIn("counted 2 bee_in", note)
+
+    def test_judge(self):
+        self.assertEqual(gt.judge((gt.PASS, "n"), []), (gt.PASS, "n"))
+        r, note = gt.judge((gt.PASS, "n"), ["the counter dropped events"])
+        self.assertEqual(r, gt.FAIL)
+        self.assertIn("dropped", note)
+        self.assertIn("n", note)
+
     def test_baseline(self):
         v = lambda i, o: {"inner": i, "outer": o}
         out = gt.eval_baseline({"GATE_00": v("none", "none"), "GATE_01": v("ambient", "none"),
@@ -308,6 +375,67 @@ class EndToEndTests(unittest.TestCase):
         finally:
             link.close()
 
+    def test_maintenance_timeout_at_a_prompt_is_recovered(self):
+        # The person walks away at a prompt for longer than the session lasts.
+        # The session is restarted before they act, so the crossing is a test
+        # stimulus, not traffic -- and the check stays valid.
+        t, counter, said = self.run_test({"GATE_04": "break"}, ["GATE_04"])
+        row = t.rows()[0]
+        self.assertEqual(counter.lifetime, 0)
+        self.assertEqual(row["bee_in"], gt.PASS, row)
+        self.assertTrue(any("had ended" in s for s in said), said)
+
+    def test_session_ending_during_a_check_fails_it(self):
+        t, counter, _ = self.run_test({"GATE_05": "ota"}, ["GATE_05"])
+        row = t.rows()[0]
+        self.assertEqual(row["bee_in"], gt.FAIL, row)
+        self.assertIn("maintenance ended during the check", row["notes"])
+        self.assertTrue(t.failed())
+
+    def test_double_count_fails(self):
+        t, _, _ = self.run_test({"GATE_06": "double"}, ["GATE_06"])
+        row = t.rows()[0]
+        self.assertEqual(row["bee_in"], gt.FAIL, row)
+        self.assertIn("counted 2 bee_in", row["notes"])
+
+    def test_sequence_gap_fails(self):
+        t, _, _ = self.run_test({"GATE_07": "gap"}, ["GATE_07"])
+        row = t.rows()[0]
+        self.assertEqual(row["bee_in"], gt.FAIL, row)
+        self.assertIn("gap", row["notes"])
+
+    def test_crosstalk_note_survives_a_pass(self):
+        t, _, _ = self.run_test({"GATE_10": "crosstalk"}, ["GATE_10"])
+        row = t.rows()[0]
+        self.assertEqual(row["inner"], gt.PASS, row)
+        self.assertIn("GATE_11 inner_block", row["notes"])
+
+    def test_chip_failure_fails_the_run(self):
+        counter = FakeCounter(chips={"U3": "bad_config", "U4": "absent"})
+        t, link, _ = make_test(counter, ["GATE_00"])
+        try:
+            t.run()
+        finally:
+            t.finish()
+            link.close()
+        # Every gate passed, and the run still fails on the chips.
+        self.assertEqual(t.rows()[0]["result"], gt.PASS)
+        chips = {name: result for name, result, _ in t.chip_results}
+        self.assertEqual(chips["U2"], gt.PASS)
+        self.assertEqual(chips["U3"], gt.FAIL)
+        self.assertEqual(chips["U4"], gt.FAIL)
+        self.assertTrue(t.failed())
+
+    def test_incomplete_reply_is_an_error(self):
+        counter = FakeCounter(mute=("events on",))
+        t, link, _ = make_test(counter, ["GATE_00"])
+        try:
+            with self.assertRaises(gt.ConsoleError) as cm:
+                t.run()
+            self.assertIn("incomplete reply", str(cm.exception))
+        finally:
+            link.close()
+
     def test_csv(self):
         import tempfile
         t, _, _ = self.run_test({}, ["GATE_00"], skip_direction=True)
@@ -319,6 +447,9 @@ class EndToEndTests(unittest.TestCase):
                 text = f.read()
             self.assertIn("gate,baseline,inner,outer,darklit,bee_in,bee_out,result,notes", text)
             self.assertIn("GATE_00,PASS,PASS,PASS,PASS,NOT TESTED,NOT TESTED,NOT TESTED", text)
+            # The bus and chip checks are part of the record too.
+            self.assertIn("i2c scan,,,,,,,PASS", text)
+            self.assertIn("U3,,,,,,,PASS", text)
         finally:
             os.unlink(path)
 

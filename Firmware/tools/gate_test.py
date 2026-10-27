@@ -31,12 +31,21 @@ Then for each gate, with a target (a strip of white paper is fine):
   5. target passed inside -> outside           -> bee_out on this gate
 
 Any check can be skipped (NOT TESTED). Events seen on OTHER gates during a
-check are reported as crosstalk notes.
+check are reported as crosstalk notes. A direction check passes only on exactly
+one crossing, and a check whose event stream had a gap (dropped events) fails:
+what it did not see could have been the wrong answer.
 
 Everything runs inside a maintenance session (``maint on``), so the counter's
 lifetime totals are untouched -- test crossings go to its test counters -- and
-the session is ended (``maint off``) on exit, including on Ctrl-C. Run it with
-the housing fitted: reflections and neighbour crosstalk depend on it.
+the session is ended (``maint off``) on exit, including on Ctrl-C. The firmware
+ends a session by itself after 30 minutes without a console command, and a
+person reading a prompt sends none, so the session is checked (and if need be
+restarted) after every prompt, before the action; a check during which the
+session ended anyway fails, because its crossings may have reached the
+lifetime totals. Run it with the housing fitted: reflections and neighbour
+crosstalk depend on it.
+
+The exit status is 0 only if nothing FAILed -- the chip checks included.
 
 The script only types console commands; it cannot do anything the console
 does not allow. A firmware without the maintenance commands (before 0.5.0)
@@ -103,6 +112,9 @@ def parse_gates(spec):
 
 _EV = re.compile(r"^\[EV\] seq=(\d+) t=(\d+) gate=(GATE_\d\d) ev=(\w+)")
 _EV_DROPPED = re.compile(r"^\[EV\] dropped=(\d+)")
+# Lines that mean the maintenance session is over: ended (timeout, OTA, request)
+# or gone with a reset. Crossings after either count toward the lifetime totals.
+_MAINT_ENDED = re.compile(r"^\[MAINT\] ended |firmware booting")
 _DARKLIT = re.compile(
     r"^\[DARKLIT\] (GATE_\d\d) bank=(\d) "
     r"inner=(\S+)/(\S+)->(\S+) outer=(\S+)/(\S+)->(\S+)")
@@ -166,11 +178,14 @@ def eval_sensor(events, gate, sensor):
 
 
 def eval_direction(events, gate, expected):
-    """expected is 'bee_in' or 'bee_out'."""
+    """expected is 'bee_in' or 'bee_out'. One pass must count exactly once."""
     mine = [e.kind for e in events if e.gate == gate]
     wrong = "bee_out" if expected == "bee_in" else "bee_in"
     note = others(events, gate)
-    if expected in mine and wrong not in mine:
+    n = mine.count(expected)
+    if n > 1 and wrong not in mine:
+        return FAIL, _join("counted %d %s for one pass" % (n, expected), note)
+    if n == 1 and wrong not in mine:
         return PASS, note
     if wrong in mine and expected not in mine:
         return FAIL, _join("counted %s: direction reversed" % wrong, note)
@@ -202,6 +217,17 @@ def eval_darklit_target(v):
     if not bad:
         return PASS, ""
     return FAIL, "with target: " + ", ".join(bad)
+
+
+def judge(result, problems):
+    """A check whose observation was compromised fails, whatever it saw.
+
+    `result` is (verdict, note) from an eval_* function; `problems` lists what
+    went wrong while watching (dropped events, the session ending).
+    """
+    if not problems:
+        return result
+    return FAIL, _join("; ".join(problems), result[1])
 
 
 def overall(results):
@@ -308,6 +334,8 @@ class GateTest(object):
         self.ask = ask
         self.say = say
         self.skip_direction = skip_direction
+        self._maint_started = False
+        self._pending = []                      # lines seen by the last prompt()
         self.chip_results = []                  # (name, result, note)
         self.baseline = {}                      # gate -> (result, note)
         self.results = {g: {} for g in gates}   # gate -> check -> (result, note)
@@ -335,16 +363,33 @@ class GateTest(object):
         lines = self.link.collect(seconds, done)
         if not seen_echo[0]:
             raise ConsoleError("no reply to %r -- wrong port, or not a HiveTraffic counter?" % cmd)
+        # The echo only says the line was read. Running out of time before the
+        # reply was complete is a failure, not an answer: callers act on these
+        # lines as if they were the whole reply.
+        if not lines or not until(lines):
+            raise ConsoleError("incomplete reply to %r (timed out after %gs)" % (cmd, seconds))
         return lines
 
     def ensure_maint(self):
-        """Make sure a maintenance session is running (it ends after 30 min idle)."""
-        lines = self.command("maint", lambda ls: ls[-1].startswith("[MAINT] o"))
-        if lines and lines[-1].startswith("[MAINT] on"):
-            return
-        lines = self.command("maint on", lambda ls: ls[-1].startswith("[MAINT] on"))
-        if not lines or not lines[-1].startswith("[MAINT] on"):
-            raise ConsoleError("could not start a maintenance session")
+        """Make sure a maintenance session is running.
+
+        -> (lines, restarted): every console line seen while checking, so the
+        caller can keep events that arrived meanwhile, and whether a session
+        had to be started although this run already had one -- i.e. it ended
+        (30 min without a command, an OTA, a reset) since the last check.
+
+        Any command also restarts the firmware's 30-minute timer, which is why
+        this runs around every prompt rather than once per gate.
+        """
+        seen = list(self.command("maint", lambda ls: ls[-1].startswith("[MAINT] o")))
+        if seen[-1].startswith("[MAINT] on"):
+            return seen, False
+        seen += self.command("maint on", lambda ls: ls[-1].startswith("[MAINT] on"))
+        restarted = self._maint_started
+        self._maint_started = True
+        if restarted:
+            self.say("    (the maintenance session had ended; started a new one)")
+        return seen, restarted
 
     def darklit(self):
         """-> {gate: verdicts} for all 24 gates."""
@@ -361,33 +406,69 @@ class GateTest(object):
             raise ConsoleError("darklit returned %d of %d gates" % (len(found), len(GATE_TAGS)))
         return found
 
+    def prompt(self, text):
+        """Ask the person something, inside a maintenance session.
+
+        -> (answer, ended): `ended` is True if the session had ended while the
+        person was at the prompt. The session is refreshed before asking, and
+        checked -- and restarted if need be -- right after the answer, before
+        the person acts on it.
+        """
+        self.ensure_maint()
+        answer = self.ask(text).strip().lower()
+        if answer == "q":
+            raise KeyboardInterrupt
+        if answer == "s":
+            return answer, False
+        self._pending, ended = self.ensure_maint()
+        return answer, ended
+
     def events_during(self, prompt):
         """Ask for an action; collect events for up to timeout_s afterwards.
 
-        Returns None if the person skipped, else the events seen. Stops early
-        two seconds after the last event, so a quick action is not kept
-        waiting for the full timeout.
+        -> None if the person skipped, else (events, problems). `problems`
+        lists what makes the window untrustworthy: dropped events (a seq gap
+        or the firmware's dropped= line) or the maintenance session ending
+        while watching. Stops early two seconds after the last event, so a
+        quick action is not kept waiting for the full timeout.
         """
-        answer = self.ask(prompt + "  [Enter = go, s = skip] ").strip().lower()
+        answer, _ = self.prompt(prompt + "  [Enter = go, s = skip] ")
         if answer == "s":
             return None
-        if answer == "q":
-            raise KeyboardInterrupt
-        self.link.drain()
         events = []
+        problems = []
+        last_seq = [None]
+
+        def take(line):
+            if _EV_DROPPED.match(line):
+                self.say("    (warning: the counter dropped events: %s)" % line)
+                _add(problems, "the counter dropped events")
+            elif _MAINT_ENDED.search(line):
+                _add(problems, "maintenance ended during the check, so its "
+                               "crossings may have reached the lifetime totals")
+            e = parse_event(line)
+            if not e:
+                return False
+            if last_seq[0] is not None and e.seq != last_seq[0] + 1:
+                _add(problems, "event stream gap (seq %d -> %d)" % (last_seq[0], e.seq))
+            last_seq[0] = e.seq
+            events.append(e)
+            return True
+
+        # Events can already arrive while ensure_maint() is talking to the
+        # console; they belong to this action.
+        for line in self._pending:
+            take(line)
+        self._pending = []
         deadline = time.monotonic() + self.timeout_s
-        quiet_until = None
+        quiet_until = time.monotonic() + self.quiet_s if events else None
         self.say("    ...watching for %ds" % self.timeout_s)
         while True:
             end = deadline if quiet_until is None else min(deadline, quiet_until)
             line = self.link.next_line(end)
             if line is None:
-                return events
-            if _EV_DROPPED.match(line):
-                self.say("    (warning: the counter dropped events: %s)" % line)
-            e = parse_event(line)
-            if e:
-                events.append(e)
+                return events, problems
+            if take(line):
                 quiet_until = time.monotonic() + self.quiet_s
 
     # -- phases -----------------------------------------------------------
@@ -402,9 +483,7 @@ class GateTest(object):
                      "unexpected " + " ".join("0x%02X" % a for a in extra) if extra else "")
         self.chip_results.append(("i2c scan", FAIL if missing or extra else PASS, note))
 
-        lines = self.command(
-            "mcp test",
-            lambda ls: sum(1 for l in ls if l.startswith("[MCPTEST]")) >= 6)
+        lines = self.command("mcp test", _mcptest_done)
         for chip in ("U2", "U3", "U4"):
             cfg = [l for l in lines if _MCPTEST_CFG.match(l) and l.split()[1] == chip]
             burst = [_MCPTEST_BURST.match(l) for l in lines]
@@ -425,7 +504,7 @@ class GateTest(object):
 
     def check_baseline(self):
         self.say("\n== Empty-tunnel baseline ==")
-        self.ask("Make sure every tunnel is EMPTY (no target, no bees), then press Enter ")
+        self.prompt("Make sure every tunnel is EMPTY (no target, no bees), then press Enter ")
         self.baseline = eval_baseline({g: v for g, v in self.darklit().items()
                                        if g in self.results})
         bad = {g: r for g, r in self.baseline.items() if r[0] != PASS}
@@ -440,24 +519,29 @@ class GateTest(object):
             self.say("\n== %s: bank switched off, skipped ==" % gate)
             return
         self.say("\n== %s ==" % gate)
-        self.ensure_maint()
 
         for sensor in ("inner", "outer"):
-            ev = self.events_during(
+            w = self.events_during(
                 "%s: hold the target over the %s sensor (%s side), then take it away."
                 % (gate, sensor.upper(), "hive" if sensor == "inner" else "entrance"))
-            r[sensor] = (NOT_TESTED, "skipped") if ev is None else eval_sensor(ev, gate, sensor)
+            r[sensor] = ((NOT_TESTED, "skipped") if w is None
+                         else judge(eval_sensor(w[0], gate, sensor), w[1]))
             self.say("    %s: %s %s" % (sensor, r[sensor][0], r[sensor][1]))
 
-        answer = self.ask("%s: hold the target over BOTH sensors and keep it there.  "
-                          "[Enter = go, s = skip] " % gate).strip().lower()
-        if answer == "q":
-            raise KeyboardInterrupt
+        # Here the person acts BEFORE pressing Enter, so a session that ended
+        # at the prompt was already gone while the target went in or out.
+        answer, ended = self.prompt("%s: hold the target over BOTH sensors and keep it "
+                                    "there.  [Enter = go, s = skip] " % gate)
         if answer == "s":
             r["darklit"] = (NOT_TESTED, "skipped")
         else:
             r["darklit"] = eval_darklit_target(self.darklit()[gate])
-            self.ask("%s: take the target away, then press Enter " % gate)
+            _, ended_after = self.prompt("%s: take the target away, then press Enter " % gate)
+            ended = ended or ended_after
+        if ended:
+            r["darklit"] = judge(r["darklit"], [
+                "maintenance had ended while the target was moved, so the "
+                "movement may have reached the lifetime totals"])
         self.say("    dark/lit: %s %s" % r["darklit"])
 
         if self.skip_direction:
@@ -466,8 +550,9 @@ class GateTest(object):
         for key, prompt, expected in (
                 ("in", "pass the target through from OUTSIDE to INSIDE (outer first)", "bee_in"),
                 ("out", "pass the target through from INSIDE to OUTSIDE (inner first)", "bee_out")):
-            ev = self.events_during("%s: %s." % (gate, prompt))
-            r[key] = (NOT_TESTED, "skipped") if ev is None else eval_direction(ev, gate, expected)
+            w = self.events_during("%s: %s." % (gate, prompt))
+            r[key] = ((NOT_TESTED, "skipped") if w is None
+                      else judge(eval_direction(w[0], gate, expected), w[1]))
             self.say("    %s: %s %s" % (expected, r[key][0], r[key][1]))
 
     def run(self):
@@ -480,12 +565,16 @@ class GateTest(object):
 
     def finish(self):
         """Leave the counter as it was. Best effort: the port may be gone."""
-        for cmd, ok in (("events off", "[CON] events off"),
-                        ("maint off", "[MAINT] ended")):
+        # "nothing to do" is a fine answer to maint off: the session had
+        # already ended on its own.
+        for cmd, ok in (("events off", ("[CON] events off",)),
+                        ("maint off", ("[MAINT] ended", "[CON] maint off: nothing"))):
             try:
                 self.command(cmd, lambda ls, ok=ok: ls[-1].startswith(ok), seconds=3.0)
-            except Exception:
-                pass
+            except Exception as e:
+                # Not fatal -- a session ends by itself after 30 minutes -- but
+                # the person should know the counter may still be in it.
+                self.say("warning: %r was not confirmed (%s)" % (cmd, e))
 
     # -- report -----------------------------------------------------------
 
@@ -497,9 +586,11 @@ class GateTest(object):
             checks["baseline"] = base
             for c in CHECKS:
                 checks.setdefault(c, (NOT_TESTED, ""))
+            # Every note, including a PASS's: crosstalk seen during a passing
+            # check is still evidence about the neighbouring gate.
             notes = _join(*["%s: %s" % (c, checks[c][1])
                             for c in ("baseline",) + CHECKS
-                            if checks[c][1] and checks[c][0] != PASS])
+                            if checks[c][1]])
             out.append({
                 "gate": gate,
                 "baseline": base[0],
@@ -527,14 +618,44 @@ class GateTest(object):
             counts[row["result"]] = counts.get(row["result"], 0) + 1
         self.say("\n%d PASS, %d FAIL, %d NOT TESTED" % (
             counts.get(PASS, 0), counts.get(FAIL, 0), counts.get(NOT_TESTED, 0)))
+        chip_fails = sum(1 for _, r, _ in self.chip_results if r == FAIL)
+        if chip_fails:
+            self.say("%d bus/chip check(s) FAILED" % chip_fails)
+
+    def failed(self):
+        """Did anything FAIL -- a gate or a bus/chip check?"""
+        return (any(r == FAIL for _, r, _ in self.chip_results) or
+                any(row["result"] == FAIL for row in self.rows()))
 
     def write_csv(self, path):
+        """Gate rows, then one row per bus/chip check (its name in `gate`)."""
         rows = self.rows()
+        fields = list(rows[0].keys()) if rows else ["gate", "result", "notes"]
         with open(path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else ["gate"])
+            w = csv.DictWriter(f, fieldnames=fields, restval="")
             w.writeheader()
             for row in rows:
                 w.writerow(row)
+            for name, result, note in self.chip_results:
+                w.writerow({"gate": name, "result": result, "notes": note})
+
+
+def _add(items, item):
+    if item not in items:
+        items.append(item)
+
+
+def _mcptest_done(lines):
+    """Two lines per chip, except a chip with no ACK, which gets one."""
+    done = set()
+    for l in lines:
+        m = _MCPTEST_CFG.match(l)
+        if m and "no ACK" in m.group(3):
+            done.add(m.group(1))
+        m = _MCPTEST_BURST.match(l)
+        if m:
+            done.add(m.group(1))
+    return done >= {"U2", "U3", "U4"}
 
 
 def _i2c_done(lines):
@@ -596,7 +717,7 @@ def main(argv=None):
     if args.csv:
         test.write_csv(args.csv)
         print("report written to %s" % args.csv)
-    if code == 0 and any(r["result"] == FAIL for r in test.rows()):
+    if code == 0 and test.failed():
         code = 3
     return code
 

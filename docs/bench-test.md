@@ -99,6 +99,15 @@ runs, the counter's real totals are frozen, so test crossings never reach
 HiveHub as bee traffic. The session is always ended when the script stops,
 even on Ctrl-C or an error.
 
+The counter ends a session by itself after 30 minutes without a console
+command, and while you read a prompt the script sends none. So the script
+checks the session before and after every prompt. If you were away long enough
+for it to end, it starts a new one before you act, and prints
+`(the maintenance session had ended; started a new one)`. If a session ends
+*during* a check anyway (an OTA from HiveHub, or a reset), that check FAILs
+with `maintenance ended during the check`, because its crossings may have
+reached the real totals. Repeat it.
+
 ---
 
 ## 5. What the script does, step by step
@@ -185,9 +194,15 @@ GATE_01     PASS        FAIL        FAIL        PASS        FAIL        FAIL    
 ```
 
 A gate is `PASS` only when every check passed, `FAIL` when any check failed,
-and `NOT TESTED` when a check was skipped and none failed. The script's exit
-code is `0` when nothing failed, `3` when something did, `1` when you stopped
-it and `2` when the console did not answer as expected.
+and `NOT TESTED` when a check was skipped and none failed. Notes are kept for
+passing checks too: crosstalk seen during a check that passed is still worth
+knowing about. The script's exit code is `0` when nothing failed (the bus and
+chip checks included), `3` when something did, `1` when you stopped it and `2`
+when the console did not answer as expected, including a reply that started but
+never finished.
+
+The CSV holds the same gate rows, followed by one row per bus and chip check
+(`i2c scan`, `U2`, `U3`, `U4`) with only `gate`, `result` and `notes` filled in.
 
 ### What a failure means
 
@@ -205,7 +220,10 @@ it and `2` when the console did not answer as expected.
 | darklit `none` with the target present | Nothing reflected: the emitter is dead or the sensor is blind | That gate's IR LED pair and its 22 Ω resistor. **Every gate on one chip `none`** → that bank's MOSFET (Q1/Q2/Q3) or its supply |
 | darklit `ambient` with the target present | Ambient light, not the emitter, is doing the work | Shade the entrance and repeat |
 | bee_in / bee_out `no crossing counted` | The sensors work but no crossing was recognised | Move more smoothly. `only a glitch` means both sensors went blocked in the same sample: the paper covered both at once. Use a narrower strip and lead with its edge |
+| bee_in / bee_out `counted 2 bee_in for one pass` | One pass was counted more than once | Move in one smooth movement without stopping in the tunnel. If it repeats, that gate double-counts real bees too: check its sensors with `--verbose` |
 | `also saw: GATE_xx ...` notes | Crosstalk to a neighbouring gate | Light leaking between tunnels: the housing walls and their fit |
+| `event stream gap` / `the counter dropped events` | Some events of that check never reached the script, so the check cannot be trusted | Repeat the step. See also the troubleshooting table below |
+| `maintenance ended during the check` | The session ended while the check ran (OTA, reset) | Repeat the step; its crossing may have reached the real totals |
 | `bank off`, gate skipped | That emitter bank is switched off (by HiveHub) | Expected if you run fewer than 24 gates; otherwise check the bank mask in `status` |
 
 ### Re-testing
@@ -244,4 +262,6 @@ python3 Firmware/tools/gate_test.py --port /dev/ttyACM0 --gates 01
 | `console error: no reply to 'maint' -- wrong port, or not a HiveTraffic counter?` | The port is not the counter, the counter is still booting (wait a few seconds and run again), or its firmware is older than 0.4.0 and has no console at all |
 | `console error: maint: [CON] error: unknown command - type 'help'` | Firmware 0.4.x: it has the console but no maintenance mode. Update the counter first (OTA via HiveHub, or `pio run -t upload` over USB). |
 | `console error: ... refused: firmware update in progress` | HiveHub is updating the counter over BLE right now. Wait until it reboots. |
-| `(warning: the counter dropped events ...)` | More events than the counter could send. Rare; repeat the step. |
+| `(warning: the counter dropped events ...)` | More events than the counter could send. That check FAILs; repeat the step. |
+| `console error: incomplete reply to '...'` | The counter started answering a command but did not finish in time. Usually a busy or disconnected USB link; run again. |
+| `warning: 'maint off' was not confirmed` | The script could not confirm the session ended. Check `status` (section 7); it ends by itself after 30 minutes anyway. |
