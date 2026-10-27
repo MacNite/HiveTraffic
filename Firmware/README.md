@@ -258,6 +258,53 @@ misses nothing. The sampler queues every edge at the full 5 ms rate into a
 If the buffer ever fills, the newest events are dropped, never the oldest. The
 gap shows as a jump in `seq`, followed by an `[EV] dropped=N` line.
 
+### Maintenance mode
+
+Commands that **change** what the counter does work only inside an explicit
+maintenance session. Everything above keeps working during one.
+
+| Command | Does |
+| --- | --- |
+| `maint on` | Start a session |
+| `maint off` | End it |
+| `maint` | Session length, time left before it ends itself, test counters, LED mode, and the banks / night mode it will restore |
+| `leds auto` / `leds on` / `leds off` | Emitters pulsed (normal), steady on, or dark. The sampler keeps reading in every mode, so `watch` and `events` show what the sensors see with the emitters forced |
+| `bank 1-3 on` / `bank 1-3 off` | Switch one emitter bank. The last enabled bank cannot be switched off |
+| `darklit` | Read every gate once with the emitters dark, then once lit, and give a verdict per sensor (see below) |
+| `mcp test` | Per chip: ACK on its address, a read-back of the configuration registers, and 100 back-to-back port reads with NACK / short-read counts and the slowest read |
+| `i2c scan` | Every address that answers on the MCP23017 bus (expected: `0x20`, `0x21`, `0x22`) |
+
+While a session runs:
+
+* **The lifetime totals are frozen.** Crossings go to the session's own
+  `test in` / `out` / `glitches` counters, and a target held over a sensor
+  does not raise the latched sensor-fault flag. Every gate is reset on entry
+  and on exit, so test stimuli never mix with real traffic.
+* **HiveHub's requests are held, not lost.** A night-mode or bank-mask write
+  that arrives during the session is logged and replayed when it ends. A
+  night-mode suspension resumes with only the time it has left, and a
+  suspension already running at `maint on` is taken over the same way.
+* **It always ends.** After 30 minutes without a console command, when an
+  OTA starts, or on any reset. On exit the LEDs go back to `auto`, and the bank
+  mask becomes HiveHub's latest request if one arrived, otherwise the mask in
+  force at entry.
+* **HiveHub can see it.** The measurement document's `maint_s` (protocol v6)
+  is the lifetime number of seconds spent in maintenance, so an interval whose
+  totals were frozen for a test is not mistaken for one with no bees.
+
+`darklit` verdicts, per sensor, with or without a target in front of it:
+
+| Dark | Lit | Verdict | Meaning |
+| --- | --- | --- | --- |
+| clear | BLOCK | `reflects` | The emitter's own light comes back: emitter, sensor and target all work |
+| clear | clear | `none` | Nothing reflected. Expected for an empty tunnel; with a target present, a dead emitter or sensor |
+| BLOCK | BLOCK | `ambient` | LOW even with the emitter off: ambient IR (sun), or an input stuck low |
+| BLOCK | clear | `inverted` | Should not happen; points at wiring |
+
+An empty tunnel and a dead emitter both read `none`. Only a target, or a
+fixture, in front of the sensor tells them apart. A whole bank reading `none`
+with targets present points at that bank's FET or supply.
+
 ---
 
 ## Tuning
@@ -359,6 +406,9 @@ No ESP32, no MCP23017 and no bee required.
   sized without it. The suite pins the refusal of an all-off mask, the
   one-based bank numbering that `gates::TABLE[].led_bank` depends on, and the
   masking of bits above the last physical bank.
+* **`include/maint_state.h`** — maintenance sessions: the inactivity timeout,
+  the replay of HiveHub's deferred night-mode and bank requests (a suspension
+  resumes with only its remaining time), and the monotonic `maint_s` figure.
 * **`include/device_name.h`** — the advertised BLE name, `HiveTraffic-AB:12`.
   The suffix is the last two bytes of the counter's own address, and every way
   of getting it wrong produces a name that still looks like a name while
@@ -385,7 +435,7 @@ Easy Bee Counter 2026 — firmware booting (BLE/GATT link)
 [MCP] U2 (gates 00..07) @ 0x20: OK
 [MCP] U3 (gates 10..17) @ 0x21: OK
 [MCP] U4 (gates 20..27) @ 0x22: OK
-[BLE] HiveTraffic-AB:12 0.4.0 advertising for HiveHub
+[BLE] HiveTraffic-AB:12 0.5.0 advertising for HiveHub
 [SETUP] Entering normal counting loop (pulsed IR)
 [CON] USB console ready - type 'help' and Enter
 ```

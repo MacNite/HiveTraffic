@@ -7,9 +7,9 @@
 // revision necessary — a uint16_t uptime that clamped at 18 hours and a
 // uint16_t glitch tally that pinned at 65535 — were both invisible in a code
 // read and both needed a device left running to reproduce, so they are pinned
-// down here instead. v4's idle_s and v5's banks are here for the same reason
-// from the other direction: both exist to say that a flat stretch of totals is
-// deliberate, and both are useless if the field name drifts.
+// down here instead. v4's idle_s, v5's banks and v6's maint_s are here for the
+// same reason from the other direction: all three exist to say that a flat
+// stretch of totals is deliberate, and all are useless if the field name drifts.
 //
 // Run them directly with any host compiler:
 //
@@ -69,32 +69,34 @@ static ble::Telemetry nominal() {
     t.glitch_count     = 2;
     t.idle_s           = 0;
     t.bank_mask        = BANK_MASK_ALL;
+    t.maint_s          = 0;
     return t;
 }
 
 // --------------------------------------------------------------------------
 
 static void test_nominal_document() {
-    g_case = "nominal v5 document";
+    g_case = "nominal v6 document";
     char json[MEASUREMENT_JSON_CAPACITY];
     const int n = buildMeasurementJson(json, sizeof(json), nominal(), "0.1.0");
     CHECK(n > 0);
     CHECK(std::strcmp(
         json,
-        "{\"fw\":5,\"ver\":\"0.1.0\",\"uptime_s\":1234,\"status\":15,"
+        "{\"fw\":6,\"ver\":\"0.1.0\",\"uptime_s\":1234,\"status\":15,"
         "\"num_gates\":24,\"mcps_healthy\":3,\"total_in\":100,"
-        "\"total_out\":95,\"glitches\":2,\"idle_s\":0,\"banks\":7}") == 0);
+        "\"total_out\":95,\"glitches\":2,\"idle_s\":0,\"banks\":7,"
+        "\"maint_s\":0}") == 0);
     CHECK(n == (int)std::strlen(json));
 }
 
-static void test_protocol_version_is_five() {
+static void test_protocol_version_is_six() {
     // The version byte is what HiveHub branches on. If this changes without the
     // parser learning the new revision, every counter goes unreadable.
     g_case = "fw is the protocol revision, not the image version";
-    CHECK(PROTOCOL_VERSION == 5);
+    CHECK(PROTOCOL_VERSION == 6);
     char json[MEASUREMENT_JSON_CAPACITY];
     buildMeasurementJson(json, sizeof(json), nominal(), "9.9.9");
-    containsField(json, "\"fw\":5");
+    containsField(json, "\"fw\":6");
     containsField(json, "\"ver\":\"9.9.9\"");
 }
 
@@ -122,6 +124,26 @@ static void test_bank_mask_is_always_reported() {
     // board's topology, and a consumer derives the active count from the mask.
     // Moving it would silently rewrite the meaning of every stored reading.
     containsField(json, "\"num_gates\":24");
+}
+
+static void test_maintenance_seconds_are_always_reported() {
+    // Totals are frozen during a USB maintenance session, so a flat interval
+    // is either a bench test or a hive with no traffic. maint_s moving is the
+    // only thing that says which — and like banks it is emitted even at 0, so
+    // "never tested" and "counter too old to say" stay distinguishable.
+    g_case = "maint_s is reported, including 0";
+    ble::Telemetry t = nominal();
+    char json[MEASUREMENT_JSON_CAPACITY];
+    CHECK(buildMeasurementJson(json, sizeof(json), t, "0.5.0") > 0);
+    containsField(json, "\"maint_s\":0");
+
+    t.maint_s = 1800;
+    CHECK(buildMeasurementJson(json, sizeof(json), t, "0.5.0") > 0);
+    containsField(json, "\"maint_s\":1800}");
+
+    t.maint_s = 70000;                  // past any 16-bit ceiling
+    CHECK(buildMeasurementJson(json, sizeof(json), t, "0.5.0") > 0);
+    containsField(json, "\"maint_s\":70000");
 }
 
 static void test_night_mode_is_visible_in_the_document() {
@@ -217,12 +239,13 @@ static void test_saturated_worst_case_fits_the_buffer() {
     t.glitch_count     = UINT32_MAX;
     t.idle_s           = UINT32_MAX;
     t.bank_mask        = 255;
+    t.maint_s          = UINT32_MAX;
     char json[MEASUREMENT_JSON_CAPACITY];
     const int n = buildMeasurementJson(json, sizeof(json), t, "255.255.255-rc1");
     CHECK(n > 0);
     CHECK(n < (int)MEASUREMENT_JSON_CAPACITY);
     // Headroom, so a longer version string cannot silently start truncating.
-    CHECK(n <= 215);
+    CHECK(n <= 232);
     std::printf("  worst case is %d of %u bytes\n", n, MEASUREMENT_JSON_CAPACITY);
 }
 
@@ -250,8 +273,9 @@ static void test_missing_version_string() {
 int main() {
     std::printf("measurement_json tests\n");
     test_nominal_document();
-    test_protocol_version_is_five();
+    test_protocol_version_is_six();
     test_bank_mask_is_always_reported();
+    test_maintenance_seconds_are_always_reported();
     test_night_mode_is_visible_in_the_document();
     test_night_idle_bit_does_not_collide();
     test_uptime_past_the_old_ceiling();

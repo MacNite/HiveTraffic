@@ -32,7 +32,9 @@ consoleline::Reader g_reader;
 // Multi-line reports are snapshotted when the command arrives and then paced
 // out line by line, so a report describes one instant even though it takes
 // several loop passes to print.
-enum class Report : uint8_t { NONE, HELP, STATUS, SENSORS, MCP };
+enum class Report : uint8_t {
+    NONE, HELP, STATUS, SENSORS, MCP, MAINT, I2C_SCAN, MCP_TEST, DARKLIT,
+};
 Report   g_report = Report::NONE;
 unsigned g_report_line = 0;
 uint32_t g_report_t_ms = 0;
@@ -40,6 +42,10 @@ diag::StatusView g_status;
 diag::GateView   g_gates[MAX_GATES];
 diag::ChipView   g_chips[diag::NUM_CHIPS];
 uint8_t  g_num_gates = 0;
+diag::MaintView   g_maint;
+diag::I2cScanView g_scan;
+diag::McpTestView g_mcp_test[diag::NUM_CHIPS];
+diag::DarkLitView g_darklit[MAX_GATES];
 
 uint32_t g_watch_period_ms = 0;   // 0 = off
 uint32_t g_watch_next_ms = 0;
@@ -62,8 +68,16 @@ const char* const HELP_LINES[] = {
     "[HELP]   events on|off   stream sensor edges and counted crossings as they happen",
     "[HELP]   help            this list",
     "[HELP] glyphs: . clear  # blocked  - bank off  ? chip unreadable  ~ not sampling",
-    "[HELP] The console only reports what the sampler already read; it never",
-    "[HELP] reads a sensor, lights an emitter or touches the totals itself.",
+    "[HELP] The commands above only report what the sampler already read; they",
+    "[HELP] never read a sensor, light an emitter or touch the totals.",
+    "[HELP] maintenance (freezes the totals; crossings go to test counters):",
+    "[HELP]   maint on|off    start / end a session (ends itself after 30 min idle)",
+    "[HELP]   maint           session state, test counters, what it will restore",
+    "[HELP]   leds auto|on|off   emitters pulsed (normal), steady on, or dark",
+    "[HELP]   bank 1-3 on|off    switch one emitter bank",
+    "[HELP]   darklit         read every gate once dark, once lit: reflection test",
+    "[HELP]   mcp test        MCP23017 register check + 100-read burst per chip",
+    "[HELP]   i2c scan        list every address that answers on the bus",
 };
 constexpr unsigned NUM_HELP_LINES = sizeof(HELP_LINES) / sizeof(HELP_LINES[0]);
 
@@ -82,6 +96,9 @@ void startReport(Report r, uint32_t now_ms) {
         break;
     case Report::MCP:
         for (uint8_t i = 0; i < diag::NUM_CHIPS; i++) diag::chipView(i, g_chips[i]);
+        break;
+    case Report::MAINT:
+        diag::maintView(g_maint);
         break;
     default:
         break;
@@ -110,9 +127,9 @@ bool emitReportLine(unsigned n) {
                 (unsigned)s.status_flags, (unsigned)s.bank_mask);
             return true;
         case 1:
-            slog::printf("[STATUS] sensing=%s night_idle=%lus ota=%s",
+            slog::printf("[STATUS] sensing=%s night_idle=%lus ota=%s maint=%s",
                          s.sensing ? "yes" : "no", (unsigned long)s.idle_s,
-                         s.ota_active ? "active" : "no");
+                         s.ota_active ? "active" : "no", s.maint ? "on" : "off");
             return true;
         case 2:
             slog::printf(
@@ -182,10 +199,112 @@ bool emitReportLine(unsigned n) {
         return true;
     }
 
+    case Report::MAINT: {
+        const diag::MaintView& m = g_maint;
+        switch (n) {
+        case 0:
+            if (!m.active) {
+                slog::printf("[MAINT] off; lifetime maintenance %lus",
+                             (unsigned long)m.total_s);
+                return true;
+            }
+            slog::printf("[MAINT] on for %lus, ends itself in %lus without a command",
+                         (unsigned long)m.session_s, (unsigned long)m.timeout_s);
+            return true;
+        case 1:
+            if (!m.active) return false;
+            slog::printf("[MAINT] test in=%lu out=%lu glitches=%lu (totals frozen)",
+                         (unsigned long)m.test_in, (unsigned long)m.test_out,
+                         (unsigned long)m.test_glitch);
+            return true;
+        case 2:
+            if (!m.active) return false;
+            slog::printf("[MAINT] leds=%s banks=0x%02X; on exit: banks 0x%02X, "
+                         "night mode %lus",
+                         diagfmt::ledName(m.leds), (unsigned)m.bank_mask,
+                         (unsigned)m.restore_mask,
+                         (unsigned long)m.restore_idle_s);
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    case Report::I2C_SCAN: {
+        if (n == 0) {
+            slog::printf("[I2C] %u device(s) answered (expected 0x20 0x21 0x22)",
+                         (unsigned)g_scan.count);
+            return true;
+        }
+        const unsigned i = n - 1;
+        const unsigned listed =
+            g_scan.count < sizeof(g_scan.addrs) ? g_scan.count : sizeof(g_scan.addrs);
+        if (i >= listed) return false;
+        slog::printf("[I2C] ack at 0x%02X", (unsigned)g_scan.addrs[i]);
+        return true;
+    }
+
+    case Report::MCP_TEST: {
+        // Two lines per chip: registers, then the read burst.
+        const unsigned chip = n / 2;
+        if (chip >= diag::NUM_CHIPS) return false;
+        const diag::McpTestView& t = g_mcp_test[chip];
+        if (n % 2 == 0) {
+            if (!t.present) {
+                slog::printf("[MCPTEST] %s 0x%02X: FAIL no ACK on its address",
+                             t.name, (unsigned)t.addr);
+            } else if (!t.regs_read) {
+                slog::printf("[MCPTEST] %s 0x%02X: FAIL register read failed",
+                             t.name, (unsigned)t.addr);
+            } else {
+                slog::printf(
+                    "[MCPTEST] %s 0x%02X: config %s iodir=%02X/%02X ipol=%02X/%02X "
+                    "gppu=%02X/%02X iocon=%02X",
+                    t.name, (unsigned)t.addr, t.config_ok ? "ok" : "FAIL",
+                    (unsigned)t.iodir_a, (unsigned)t.iodir_b, (unsigned)t.ipol_a,
+                    (unsigned)t.ipol_b, (unsigned)t.gppu_a, (unsigned)t.gppu_b,
+                    (unsigned)t.iocon);
+            }
+            return true;
+        }
+        if (!t.present) return true;   // nothing to say; keep the pairing
+        slog::printf("[MCPTEST] %s burst %s: %u/%u ok nack=%u short=%u max=%luus",
+                     t.name, t.burst_ok == t.burst ? "ok" : "FAIL",
+                     (unsigned)t.burst_ok, (unsigned)t.burst, (unsigned)t.burst_nack,
+                     (unsigned)t.burst_short, (unsigned long)t.burst_max_us);
+        return true;
+    }
+
+    case Report::DARKLIT: {
+        if (n == 0) {
+            slog::printf("[DARKLIT] inner/outer = dark/lit -> verdict "
+                         "(reflects / none / ambient / inverted)");
+            return true;
+        }
+        const unsigned i = n - 1;
+        if (i >= g_num_gates) return false;
+        const diag::DarkLitView& d = g_darklit[i];
+        slog::printf(
+            "[DARKLIT] %s bank=%u inner=%s/%s->%s outer=%s/%s->%s", d.tag,
+            (unsigned)d.bank, diagfmt::word(d.inner_dark),
+            diagfmt::word(d.inner_lit),
+            diagfmt::darkLitVerdict(d.inner_dark, d.inner_lit),
+            diagfmt::word(d.outer_dark), diagfmt::word(d.outer_lit),
+            diagfmt::darkLitVerdict(d.outer_dark, d.outer_lit));
+        return true;
+    }
+
     case Report::NONE:
     default:
         return false;
     }
+}
+
+// Word a maintenance command's outcome. Returns true if it succeeded.
+bool reportResult(const char* what, diag::Result r) {
+    if (r == diag::Result::OK) return true;
+    slog::printf("[CON] %s: %s", what, diagfmt::resultText(r));
+    return false;
 }
 
 void emitWatchLine(uint32_t now_ms) {
@@ -211,6 +330,9 @@ void handleLine(const char* line, uint32_t now_ms) {
     // Echo what was understood, so a terminal without local echo still shows
     // which command produced the output that follows.
     slog::printf("[CON] > %s", line);
+    // Any line, valid or not, is someone at the terminal: a running
+    // maintenance session is still in use.
+    diag::maintTouch();
 
     switch (c.verb) {
     case consoleline::Verb::NONE:
@@ -245,6 +367,54 @@ void handleLine(const char* line, uint32_t now_ms) {
         g_events_dropped_reported = g_events.dropped;
         slog::printf("[CON] events %s (next seq=%lu)", g_events_on ? "on" : "off",
                      (unsigned long)g_events.next_seq);
+        break;
+    case consoleline::Verb::MAINT:
+        if (c.arg == consoleline::MAINT_ON) {
+            if (reportResult("maint on", diag::maintEnter())) {
+                startReport(Report::MAINT, now_ms);
+            }
+        } else if (c.arg == consoleline::MAINT_OFF) {
+            reportResult("maint off", diag::maintExit());
+        } else {
+            startReport(Report::MAINT, now_ms);
+        }
+        break;
+    case consoleline::Verb::LEDS: {
+        const diag::LedSetting l =
+            c.arg == consoleline::LEDS_ON  ? diag::LedSetting::ON
+          : c.arg == consoleline::LEDS_OFF ? diag::LedSetting::OFF
+                                           : diag::LedSetting::AUTO;
+        if (reportResult("leds", diag::setLeds(l))) {
+            slog::printf("[CON] leds %s", diagfmt::ledName(l));
+        }
+        break;
+    }
+    case consoleline::Verb::BANK: {
+        const diag::Result r = diag::setBank((uint8_t)c.arg, c.arg2 != 0);
+        if (r == diag::Result::REFUSED) {
+            slog::printf("[CON] bank: refused - at least one bank must stay on");
+        } else if (reportResult("bank", r)) {
+            slog::printf("[CON] bank %lu %s", (unsigned long)c.arg,
+                         c.arg2 ? "on" : "off");
+        }
+        break;
+    }
+    case consoleline::Verb::I2C_SCAN:
+        if (reportResult("i2c scan", diag::i2cScan(g_scan))) {
+            startReport(Report::I2C_SCAN, now_ms);
+        }
+        break;
+    case consoleline::Verb::MCP_TEST:
+        if (reportResult("mcp test", diag::mcpTest(g_mcp_test))) {
+            startReport(Report::MCP_TEST, now_ms);
+        }
+        break;
+    case consoleline::Verb::DARKLIT:
+        g_num_gates = diag::numGates();
+        if (g_num_gates > MAX_GATES) g_num_gates = MAX_GATES;
+        if (reportResult("darklit", diag::darkLit(g_darklit, g_num_gates))) {
+            startReport(Report::DARKLIT, now_ms);
+        }
         break;
     case consoleline::Verb::BAD_ARG:
         slog::printf("[CON] error: bad argument - type 'help'");

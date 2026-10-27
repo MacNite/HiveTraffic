@@ -47,13 +47,17 @@ namespace beecounter_proto {
 //      not counted, and the totals for them are permanently flat. Without the
 //      field that is indistinguishable from a dead FET — the same failure
 //      idle_s was added to disambiguate, at a third of the counter each time.
+// v6 = adds the "maint_s" field: lifetime seconds spent in USB maintenance
+//      sessions (maint_state.h). The totals are frozen while a session runs,
+//      so this is what tells a flat interval that was a bench test from a hive
+//      with no traffic. Purely additive, like v4 and v5.
 //
 // A counter in the field keeps emitting an older revision until it is updated
 // over the air, and the OTA relay has to read this very characteristic before
 // it can update anything — so HiveHub's parser reads "fw" first and accepts
 // every revision. Its tolerant parser must be deployed BEFORE any counter
 // emitting the new one.
-constexpr uint8_t PROTOCOL_VERSION = 5;
+constexpr uint8_t PROTOCOL_VERSION = 6;
 
 // --------------------------------------------------------------------------
 // Status bitfield — reported as the JSON "status" field

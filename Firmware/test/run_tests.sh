@@ -25,7 +25,12 @@
 #                                 command grammar;
 #   * include/event_ring.h      — the queue between the sampler and the
 #                                 console's event stream, and its visible gaps;
-#   * include/diag_format.h     — the console's glyphs and row layout.
+#   * include/diag_format.h     — the console's glyphs and row layout, the
+#                                 dark/lit verdicts and the MCP23017 register
+#                                 check;
+#   * include/maint_state.h     — maintenance sessions: the inactivity timeout,
+#                                 the replay of HiveHub's deferred requests and
+#                                 the maint_s figure.
 #
 # Everything hardware-facing stays in src/main.cpp and is still verified on the
 # bench (see the USB diagnostic console in the README).
@@ -42,7 +47,7 @@ OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
 for t in gate_logic measurement_json idle_state bank_state device_name \
-         log_line poll_timing console_line event_ring diag_format; do
+         log_line poll_timing console_line event_ring diag_format maint_state; do
     "$CXX" -std=c++11 -Wall -Wextra -Werror \
         -I include \
         "test/test_$t/test_$t.cpp" \

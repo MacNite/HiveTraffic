@@ -83,6 +83,7 @@ struct StatusView {
     uint32_t window_late = 0;
     uint32_t window_max_gap_us = 0;
     uint32_t window_max_poll_us = 0;
+    bool     maint = false;      // a maintenance session is running
 };
 
 constexpr uint8_t NUM_CHIPS = 3;
@@ -92,5 +93,84 @@ uint8_t numGates();
 void    gateView(uint8_t gate, GateView& out);
 void    chipView(uint8_t chip, ChipView& out);
 void    statusView(StatusView& out);
+
+// ---------------------------------------------------------------------------
+// Maintenance mode (see maint_state.h)
+// ---------------------------------------------------------------------------
+// Unlike everything above, these DO change what the counter does. Each one
+// is refused unless a maintenance session is active (except entering one),
+// and refused outright while an OTA is running — main.cpp enforces both, the
+// console only words the refusal.
+
+enum class Result : uint8_t {
+    OK,
+    NOT_IN_MAINT,   // command needs `maint on` first
+    OTA_ACTIVE,     // a firmware transfer owns the counter right now
+    ALREADY,        // e.g. `maint on` while already in maintenance
+    REFUSED,        // e.g. switching off the last enabled bank
+};
+
+enum class LedSetting : uint8_t { AUTO, ON, OFF };
+
+struct MaintView {
+    bool       active = false;
+    uint32_t   timeout_s = 0;        // inactivity left before it ends itself
+    uint32_t   session_s = 0;        // length of the running session
+    uint32_t   total_s = 0;          // lifetime maintenance seconds ("maint_s")
+    uint32_t   test_in = 0;          // crossings during this session
+    uint32_t   test_out = 0;
+    uint32_t   test_glitch = 0;
+    LedSetting leds = LedSetting::AUTO;
+    uint8_t    bank_mask = 0;        // mask in force now
+    uint8_t    restore_mask = 0;     // mask the session will restore
+    uint32_t   restore_idle_s = 0;   // night mode the session will resume
+};
+
+Result maintEnter();
+Result maintExit();
+// A console command arrived; keeps the session from timing out.
+void   maintTouch();
+void   maintView(MaintView& out);
+
+Result setLeds(LedSetting setting);
+Result setBank(uint8_t bank, bool on);
+
+// Every 7-bit address that ACKs on the MCP23017 bus.
+struct I2cScanView {
+    uint8_t count = 0;
+    uint8_t addrs[16] = {0};   // first 16 found; `count` may be larger
+};
+Result i2cScan(I2cScanView& out);
+
+// Register read-back plus a burst of repeated port reads, per chip.
+struct McpTestView {
+    const char* name = "";
+    uint8_t  addr = 0;
+    bool     present = false;      // ACKed its address
+    bool     regs_read = false;    // the 14-byte register read succeeded
+    uint8_t  iodir_a = 0, iodir_b = 0;   // expect 0xFF: all inputs
+    uint8_t  ipol_a = 0, ipol_b = 0;     // expect 0x00: no inversion
+    uint8_t  gppu_a = 0, gppu_b = 0;     // expect 0x00: board pull-ups only
+    uint8_t  iocon = 0;                  // expect BANK=0, SEQOP=0
+    bool     config_ok = false;
+    uint16_t burst = 0;            // reads attempted
+    uint16_t burst_ok = 0;
+    uint16_t burst_nack = 0;
+    uint16_t burst_short = 0;
+    uint32_t burst_max_us = 0;
+};
+Result mcpTest(McpTestView (&out)[NUM_CHIPS]);
+
+// One read with every enabled emitter dark, then one lit, per gate. Tells an
+// emitter-dependent reflection from ambient light or a stuck input.
+struct DarkLitView {
+    const char* tag = "";
+    uint8_t     bank = 0;
+    SensorView  inner_dark = SensorView::INVALID;
+    SensorView  inner_lit = SensorView::INVALID;
+    SensorView  outer_dark = SensorView::INVALID;
+    SensorView  outer_lit = SensorView::INVALID;
+};
+Result darkLit(DarkLitView* out, uint8_t n);
 
 }  // namespace diag

@@ -33,12 +33,12 @@ The value is generated when HiveHub reads it, so it contains current lifetime
 totals rather than a periodically cached snapshot:
 
 ```json
-{"fw":5,"ver":"0.3.0","uptime_s":1234,"status":15,"num_gates":24,"mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,"banks":7}
+{"fw":6,"ver":"0.5.0","uptime_s":1234,"status":15,"num_gates":24,"mcps_healthy":3,"total_in":100,"total_out":95,"glitches":2,"idle_s":0,"banks":7,"maint_s":0}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `fw` | uint8 | Revision of *this document's* format (`PROTOCOL_VERSION`), currently 5 |
+| `fw` | uint8 | Revision of *this document's* format (`PROTOCOL_VERSION`), currently 6 |
 | `ver` | string | Image version from `include/version.h`, `MAJOR.MINOR.PATCH` |
 | `uptime_s` | uint32 | Seconds since boot |
 | `status` | uint8 | Status bitfield, see `include/counter_protocol.h` |
@@ -48,11 +48,13 @@ totals rather than a periodically cached snapshot:
 | `glitches` | uint32 | Diagnostic tally of ambiguous/aborted pairings, saturating |
 | `idle_s` | uint32 | Seconds of night-mode suspension still to run; `0` while counting |
 | `banks` | uint8 | Bitmask of enabled emitter banks (MOSFETs): bit 0 = gates 00..07, bit 1 = 10..17, bit 2 = 20..27. `7` unless banks have been switched off |
+| `maint_s` | uint32 | Lifetime seconds spent in USB maintenance sessions, including one still running; monotonic, saturating. The totals are frozen during a session, so any increase over an interval means that interval's flat totals were a test |
 
 The field names, UUIDs, and integer types match HiveHub's
-`firmware/include/bee_counter_wire.h` parser, which reads `fw` first and
-accepts both this revision and the previous one. The firmware deliberately
-emits only the fields in HiveHub's documented contract.
+`firmware/include/bee_counter_wire.h` parser, which reads `fw` first, branches
+on `fw >=` and skips keys it does not know. `maint_s` (v6) is ahead of that
+parser: a HiveHub that predates it reads the document as v5 and ignores the
+field until its parser learns it (see [v6](#v6--current)).
 
 The exact bytes are produced by `include/measurement_json.h` and pinned by
 `test/test_measurement_json/`, which runs on a host compiler — see
@@ -450,7 +452,29 @@ before treating OTA as secure against a nearby active attacker.
 set, name, meaning or range of the reported fields changes; a firmware fix that
 reports the same fields bumps `ver` and leaves `fw` alone.
 
-### v5 — current
+### v6 — current
+
+USB maintenance mode. A person at the counter's USB console can start a
+maintenance session, during which the totals are frozen, crossings go to test
+counters, and HiveHub's night-mode and bank writes are held and replayed when
+the session ends (see "Maintenance mode" in `Firmware/README.md`). The document
+now says how long the counter has spent like that.
+
+| Change | v5 | v6 |
+| --- | --- | --- |
+| Lifetime maintenance time | — | `maint_s` (uint32, seconds, monotonic) |
+
+Additive, like v4 and v5: HiveHub's `bee_counter_wire.h` skips unknown keys and
+branches on `fw >=`, so a HiveHub that predates v6 reads a v6 document exactly
+as v5 and simply does not know about maintenance. To use the field it differences
+`maint_s` like the totals; an interval where it moved had its totals frozen for
+some or all of its length.
+
+During a session the control characteristic still accepts `SET_IDLE` and
+`SET_BANKS` and reports the duration or mask that will apply, but the read-back
+shows the state actually in force, which is the bench's until the session ends.
+
+### v5
 
 Emitter bank enables. The three MOSFETs of the 2026-08 board can be switched
 individually (see [Emitter banks](#emitter-banks-the-other-power-control)), and

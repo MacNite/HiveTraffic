@@ -69,4 +69,65 @@ inline bool sensorRow(char* out, unsigned cap, const diag::GateView* gates,
     return true;
 }
 
+inline const char* ledName(diag::LedSetting l) {
+    switch (l) {
+    case diag::LedSetting::AUTO: return "auto";
+    case diag::LedSetting::ON:   return "on";
+    case diag::LedSetting::OFF:  return "off";
+    }
+    return "?";
+}
+
+inline const char* resultText(diag::Result r) {
+    switch (r) {
+    case diag::Result::OK:           return "ok";
+    case diag::Result::NOT_IN_MAINT: return "refused: not in maintenance - 'maint on' first";
+    case diag::Result::OTA_ACTIVE:   return "refused: firmware update in progress";
+    case diag::Result::ALREADY:      return "nothing to do";
+    case diag::Result::REFUSED:      return "refused";
+    }
+    return "?";
+}
+
+// What one sensor's dark and lit readings, taken back to back with a target
+// (or nothing) in front of it, say about that sensor.
+//
+//   lit BLOCK, dark clear  "reflects"  the emitter's own light comes back:
+//                                      emitter, sensor and target all work
+//   both clear             "none"      nothing reflected: no target, or a dead
+//                                      emitter / sensor. Expected when empty
+//   both BLOCK             "ambient"   LOW without the emitter: ambient IR (sun)
+//                                      or an input stuck low
+//   lit clear, dark BLOCK  "inverted"  should not happen; points at wiring
+//
+// Anything not a reading (bank off, chip unreadable) is reported as such.
+inline const char* darkLitVerdict(diag::SensorView dark, diag::SensorView lit) {
+    using diag::SensorView;
+    const bool readable =
+        (dark == SensorView::CLEAR || dark == SensorView::BLOCKED) &&
+        (lit == SensorView::CLEAR || lit == SensorView::BLOCKED);
+    if (!readable) {
+        return word(lit != SensorView::CLEAR && lit != SensorView::BLOCKED ? lit : dark);
+    }
+    if (lit == SensorView::BLOCKED) {
+        return dark == SensorView::CLEAR ? "reflects" : "ambient";
+    }
+    return dark == SensorView::CLEAR ? "none" : "inverted";
+}
+
+// MCP23017 register values the firmware relies on (IOCON.BANK = 0 addressing).
+// All sixteen pins inputs, no polarity inversion, internal pull-ups off (the
+// board has 100k), and IOCON with BANK = 0 (register map as addressed) and
+// SEQOP = 0 (sequential reads, which the two-byte GPIOA+GPIOB read needs).
+constexpr uint8_t IOCON_BANK  = 0x80;
+constexpr uint8_t IOCON_SEQOP = 0x20;
+
+inline bool mcpConfigOk(uint8_t iodir_a, uint8_t iodir_b, uint8_t ipol_a,
+                        uint8_t ipol_b, uint8_t gppu_a, uint8_t gppu_b,
+                        uint8_t iocon) {
+    return iodir_a == 0xFF && iodir_b == 0xFF && ipol_a == 0x00 &&
+           ipol_b == 0x00 && gppu_a == 0x00 && gppu_b == 0x00 &&
+           (iocon & (IOCON_BANK | IOCON_SEQOP)) == 0;
+}
+
 }  // namespace diagfmt

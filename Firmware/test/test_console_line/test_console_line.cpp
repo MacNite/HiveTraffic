@@ -169,6 +169,45 @@ static void test_events() {
     CHECK(parse("events on off").verb == Verb::BAD_ARG);
 }
 
+static void test_maintenance_commands() {
+    g_case = "maintenance commands parse exactly";
+    Command c = parse("maint on");
+    CHECK(c.verb == Verb::MAINT && c.arg == MAINT_ON);
+    c = parse("MAINT off");
+    CHECK(c.verb == Verb::MAINT && c.arg == MAINT_OFF);
+    c = parse("maint");
+    CHECK(c.verb == Verb::MAINT && c.arg == MAINT_SHOW);
+    CHECK(parse("maint please").verb == Verb::BAD_ARG);
+
+    c = parse("leds auto");
+    CHECK(c.verb == Verb::LEDS && c.arg == LEDS_AUTO);
+    c = parse("leds on");
+    CHECK(c.verb == Verb::LEDS && c.arg == LEDS_ON);
+    c = parse("leds off");
+    CHECK(c.verb == Verb::LEDS && c.arg == LEDS_OFF);
+    CHECK(parse("leds").verb == Verb::BAD_ARG);
+    CHECK(parse("leds dim").verb == Verb::BAD_ARG);
+
+    c = parse("bank 2 off");
+    CHECK(c.verb == Verb::BANK && c.arg == 2 && c.arg2 == 0);
+    c = parse("bank 3 ON");
+    CHECK(c.verb == Verb::BANK && c.arg == 3 && c.arg2 == 1);
+    CHECK(parse("bank 0 on").verb == Verb::BAD_ARG);
+    CHECK(parse("bank 4 on").verb == Verb::BAD_ARG);
+    CHECK(parse("bank 1").verb == Verb::BAD_ARG);
+    CHECK(parse("bank on 1").verb == Verb::BAD_ARG);
+    CHECK(parse("bank 1 on now").verb == Verb::BAD_ARG);
+
+    CHECK(parse("i2c scan").verb == Verb::I2C_SCAN);
+    CHECK(parse("i2c").verb == Verb::BAD_ARG);
+    CHECK(parse("i2c probe").verb == Verb::BAD_ARG);
+    CHECK(parse("mcp test").verb == Verb::MCP_TEST);
+    CHECK(parse("mcp").verb == Verb::MCP);
+    CHECK(parse("mcp exam").verb == Verb::BAD_ARG);
+    CHECK(parse("darklit").verb == Verb::DARKLIT);
+    CHECK(parse("darklit 1").verb == Verb::BAD_ARG);
+}
+
 static void test_unknown() {
     g_case = "anything else is unknown, including over-long words";
     CHECK(parse("reboot").verb == Verb::UNKNOWN);
@@ -187,6 +226,7 @@ int main() {
     test_simple_verbs_reject_arguments();
     test_watch();
     test_events();
+    test_maintenance_commands();
     test_unknown();
 
     if (g_failures == 0) {

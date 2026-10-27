@@ -113,6 +113,44 @@ static void test_short_rows() {
     CHECK(empty[0] == '\0');
 }
 
+static void test_dark_lit_verdicts() {
+    g_case = "dark/lit pairs map to the four verdicts";
+    using diagfmt::darkLitVerdict;
+    CHECK(std::strcmp(darkLitVerdict(SensorView::CLEAR, SensorView::BLOCKED), "reflects") == 0);
+    CHECK(std::strcmp(darkLitVerdict(SensorView::CLEAR, SensorView::CLEAR), "none") == 0);
+    CHECK(std::strcmp(darkLitVerdict(SensorView::BLOCKED, SensorView::BLOCKED), "ambient") == 0);
+    CHECK(std::strcmp(darkLitVerdict(SensorView::BLOCKED, SensorView::CLEAR), "inverted") == 0);
+    // Not a reading: say which kind, never invent a verdict.
+    CHECK(std::strcmp(darkLitVerdict(SensorView::BANK_OFF, SensorView::BANK_OFF),
+                      diagfmt::word(SensorView::BANK_OFF)) == 0);
+    CHECK(std::strcmp(darkLitVerdict(SensorView::CLEAR, SensorView::INVALID),
+                      diagfmt::word(SensorView::INVALID)) == 0);
+    CHECK(std::strcmp(darkLitVerdict(SensorView::INVALID, SensorView::BLOCKED),
+                      diagfmt::word(SensorView::INVALID)) == 0);
+}
+
+static void test_mcp_config_check() {
+    g_case = "the register check accepts exactly the configuration relied on";
+    using diagfmt::mcpConfigOk;
+    // Power-on defaults after pinMode(INPUT): all inputs, no inversion, no
+    // pull-ups, IOCON zero.
+    CHECK(mcpConfigOk(0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00));
+    // IOCON bits other than BANK and SEQOP do not matter to the reads.
+    CHECK(mcpConfigOk(0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x02));
+    CHECK(!mcpConfigOk(0xFE, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00));   // an output
+    CHECK(!mcpConfigOk(0xFF, 0xFF, 0x00, 0x01, 0x00, 0x00, 0x00));   // inverted
+    CHECK(!mcpConfigOk(0xFF, 0xFF, 0x00, 0x00, 0x80, 0x00, 0x00));   // pull-up on
+    CHECK(!mcpConfigOk(0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x80));   // BANK=1
+    CHECK(!mcpConfigOk(0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x20));   // SEQOP=1
+}
+
+static void test_result_text() {
+    g_case = "every refusal has wording";
+    CHECK(std::strcmp(diagfmt::resultText(diag::Result::NOT_IN_MAINT), "?") != 0);
+    CHECK(std::strcmp(diagfmt::resultText(diag::Result::OTA_ACTIVE), "?") != 0);
+    CHECK(std::strcmp(diagfmt::ledName(diag::LedSetting::OFF), "off") == 0);
+}
+
 int main() {
     std::printf("diag_format tests\n");
     test_glyphs_are_distinct();
@@ -120,6 +158,9 @@ int main() {
     test_sensor_row_layout();
     test_sensor_row_refuses_small_buffer();
     test_short_rows();
+    test_dark_lit_verdicts();
+    test_mcp_config_check();
+    test_result_text();
 
     if (g_failures == 0) {
         std::printf("all tests passed\n");
