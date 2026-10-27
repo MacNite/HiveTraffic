@@ -81,9 +81,25 @@ enum class Verb : uint8_t {
     MCP,
     WATCH,      // arg = rate in Hz, 0 = off
     EVENTS,     // arg = 1 on, 0 off
+    // Maintenance (see maint_state.h). MAINT itself is always accepted; the
+    // rest are refused by the console unless a session is active.
+    MAINT,      // arg = MAINT_OFF / MAINT_ON / MAINT_SHOW
+    LEDS,       // arg = LEDS_AUTO / LEDS_ON / LEDS_OFF
+    BANK,       // arg = bank 1..3, arg2 = 1 on / 0 off
+    I2C_SCAN,
+    MCP_TEST,
+    DARKLIT,
     UNKNOWN,    // first word not recognised
     BAD_ARG,    // recognised verb, unusable argument
 };
+
+constexpr uint32_t MAINT_OFF  = 0;
+constexpr uint32_t MAINT_ON   = 1;
+constexpr uint32_t MAINT_SHOW = 2;
+
+constexpr uint32_t LEDS_AUTO = 0;
+constexpr uint32_t LEDS_ON   = 1;
+constexpr uint32_t LEDS_OFF  = 2;
 
 // Highest rate `watch` accepts. Each watch line is ~100 bytes, so 10 Hz is
 // ~1 KB/s — trivial for USB, and already faster than anyone can read.
@@ -91,9 +107,13 @@ constexpr uint32_t WATCH_MAX_HZ = 10;
 // Rate used by a bare `watch`.
 constexpr uint32_t WATCH_DEFAULT_HZ = 5;
 
+// Banks a `bank` command may name.
+constexpr uint32_t BANK_MAX = 3;
+
 struct Command {
     Verb     verb = Verb::NONE;
     uint32_t arg = 0;
+    uint32_t arg2 = 0;
 };
 
 // Split off the next space-separated word of `*p`, lower-casing it into `out`.
@@ -126,64 +146,114 @@ inline bool parseUint(const char* s, uint32_t max, uint32_t& out) {
     return true;
 }
 
+// on/off -> 1/0.
+inline bool parseOnOff(const char* s, uint32_t& out) {
+    if (strcmp(s, "on") == 0)  { out = 1; return true; }
+    if (strcmp(s, "off") == 0) { out = 0; return true; }
+    return false;
+}
+
+constexpr unsigned MAX_WORDS = 3;
+constexpr unsigned WORD_CAP = 12;
+
 inline Command parse(const char* line) {
     Command c;
+    char w[MAX_WORDS][WORD_CAP];
+    unsigned n = 0;
     const char* p = line;
-    char verb[12];
-    char arg[12];
-    if (!nextWord(p, verb, sizeof(verb))) {
-        // Either blank, or a first word too long to be any verb.
-        while (*line == ' ' || *line == '\t') line++;
-        c.verb = (*line == '\0') ? Verb::NONE : Verb::UNKNOWN;
+    bool too_much = false;
+    while (true) {
+        char word[WORD_CAP];
+        if (!nextWord(p, word, sizeof(word))) {
+            // Out of words, or one too long for any verb or argument (which
+            // leaves input behind).
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p != '\0') too_much = true;
+            break;
+        }
+        if (n == MAX_WORDS) {
+            too_much = true;
+            break;
+        }
+        memcpy(w[n++], word, sizeof(word));
+    }
+    if (n == 0) {
+        c.verb = too_much ? Verb::UNKNOWN : Verb::NONE;
         return c;
     }
-    const bool has_arg = nextWord(p, arg, sizeof(arg));
-    char extra[2];
-    const bool has_extra = has_arg && nextWord(p, extra, sizeof(extra));
-    // A word too long for `arg` also lands here: nextWord() returned false
-    // with input left over.
-    while (*p == ' ' || *p == '\t') p++;
-    const bool leftover = has_extra || *p != '\0';
+    const char* verb = w[0];
+    const unsigned nargs = n - 1;
 
-    auto noArgs = [&](Verb v) {
-        c.verb = (has_arg || leftover) ? Verb::BAD_ARG : v;
-    };
+    // Verb known, argument shape wrong.
+    auto bad = [&]() { c.verb = Verb::BAD_ARG; return c; };
 
     if (strcmp(verb, "help") == 0 || strcmp(verb, "?") == 0 ||
         strcmp(verb, "h") == 0) {
-        noArgs(Verb::HELP);
+        if (too_much || nargs) return bad();
+        c.verb = Verb::HELP;
     } else if (strcmp(verb, "status") == 0) {
-        noArgs(Verb::STATUS);
+        if (too_much || nargs) return bad();
+        c.verb = Verb::STATUS;
     } else if (strcmp(verb, "sensors") == 0) {
-        noArgs(Verb::SENSORS);
+        if (too_much || nargs) return bad();
+        c.verb = Verb::SENSORS;
     } else if (strcmp(verb, "mcp") == 0) {
-        noArgs(Verb::MCP);
+        if (too_much || nargs > 1) return bad();
+        if (nargs == 0) {
+            c.verb = Verb::MCP;
+        } else if (strcmp(w[1], "test") == 0) {
+            c.verb = Verb::MCP_TEST;
+        } else {
+            return bad();
+        }
     } else if (strcmp(verb, "watch") == 0) {
-        if (leftover) {
-            c.verb = Verb::BAD_ARG;
-        } else if (!has_arg) {
+        if (too_much || nargs > 1) return bad();
+        if (nargs == 0) {
             c.verb = Verb::WATCH;
             c.arg = WATCH_DEFAULT_HZ;
-        } else if (strcmp(arg, "off") == 0) {
+        } else if (strcmp(w[1], "off") == 0) {
             c.verb = Verb::WATCH;
             c.arg = 0;
-        } else if (parseUint(arg, WATCH_MAX_HZ, c.arg)) {
+        } else if (parseUint(w[1], WATCH_MAX_HZ, c.arg)) {
             c.verb = Verb::WATCH;
         } else {
-            c.verb = Verb::BAD_ARG;
+            return bad();
         }
     } else if (strcmp(verb, "events") == 0) {
-        if (!has_arg || leftover) {
-            c.verb = Verb::BAD_ARG;
-        } else if (strcmp(arg, "on") == 0) {
-            c.verb = Verb::EVENTS;
-            c.arg = 1;
-        } else if (strcmp(arg, "off") == 0) {
-            c.verb = Verb::EVENTS;
-            c.arg = 0;
-        } else {
-            c.verb = Verb::BAD_ARG;
+        if (too_much || nargs != 1 || !parseOnOff(w[1], c.arg)) return bad();
+        c.verb = Verb::EVENTS;
+    } else if (strcmp(verb, "maint") == 0) {
+        if (too_much || nargs > 1) return bad();
+        if (nargs == 0) {
+            c.arg = MAINT_SHOW;
+        } else if (!parseOnOff(w[1], c.arg)) {
+            return bad();
         }
+        c.verb = Verb::MAINT;
+    } else if (strcmp(verb, "leds") == 0) {
+        if (too_much || nargs != 1) return bad();
+        if (strcmp(w[1], "auto") == 0) {
+            c.arg = LEDS_AUTO;
+        } else if (strcmp(w[1], "on") == 0) {
+            c.arg = LEDS_ON;
+        } else if (strcmp(w[1], "off") == 0) {
+            c.arg = LEDS_OFF;
+        } else {
+            return bad();
+        }
+        c.verb = Verb::LEDS;
+    } else if (strcmp(verb, "bank") == 0) {
+        if (too_much || nargs != 2 || !parseUint(w[1], BANK_MAX, c.arg) ||
+            c.arg == 0 || !parseOnOff(w[2], c.arg2)) {
+            return bad();
+        }
+        c.verb = Verb::BANK;
+    } else if (strcmp(verb, "i2c") == 0) {
+        if (too_much || nargs != 1 || strcmp(w[1], "scan") != 0) return bad();
+        c.verb = Verb::I2C_SCAN;
+    } else if (strcmp(verb, "darklit") == 0) {
+        if (too_much || nargs) return bad();
+        c.verb = Verb::DARKLIT;
     } else {
         c.verb = Verb::UNKNOWN;
     }

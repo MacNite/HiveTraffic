@@ -37,6 +37,12 @@ struct Telemetry {
     // indistinguishable from the FET having died. 0x07 on any counter that
     // has not been told otherwise.
     uint8_t bank_mask;
+    // Lifetime seconds spent in USB maintenance sessions, including one still
+    // running. New in protocol v6, reported as "maint_s". Totals are frozen
+    // while a session runs (its crossings are test stimuli), so a flat
+    // interval with this figure moving was a bench test, not a hive with no
+    // traffic. Monotonic like the totals; 0 on a counter never tested.
+    uint32_t maint_s;
 };
 
 void getTelemetry(Telemetry& out);

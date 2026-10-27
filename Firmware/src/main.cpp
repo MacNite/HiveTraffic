@@ -100,6 +100,8 @@
 #include "serial_log.h"
 #include "diag.h"
 #include "diag_console.h"
+#include "diag_format.h"
+#include "maint_state.h"
 
 // The BLE/GATT transport: a connectable NimBLE GATT server serving the
 // measurement characteristic and the OTA characteristics. See ble_link.h.
@@ -259,6 +261,12 @@ static idlestate::State g_idle;
 // comes back with all three banks counting, and HiveHub re-asserts the mask on
 // its next upload cycle. See bank_state.h.
 static bankstate::State g_banks;
+
+// Maintenance session (USB console `maint on`). Owned here for the same reason
+// g_idle and g_banks are: while it runs, this file routes crossings into test
+// counters and holds HiveHub's night-mode and bank requests back. Never
+// persisted: a reset always comes back counting. See maint_state.h.
+static maintstate::State g_maint;
 
 // ============================================================================
 // MCP23017 channels + runtime health  (all on Wire / bus 0)
@@ -692,6 +700,23 @@ static bool pollAllGates() {
             }
         }
 
+        // In maintenance, crossings are test stimuli: they go to the
+        // session's own counters and never reach the lifetime totals HiveHub
+        // differences into traffic.
+        if (g_maint.active) {
+            switch (u.event) {
+            case gatelogic::GateEvent::BEE_IN:  maintstate::saturatingInc(g_maint.test_in);     break;
+            case gatelogic::GateEvent::BEE_OUT: maintstate::saturatingInc(g_maint.test_out);    break;
+            case gatelogic::GateEvent::GLITCH:  maintstate::saturatingInc(g_maint.test_glitch); break;
+            case gatelogic::GateEvent::NONE:
+            default:
+                break;
+            }
+            // Nor is a target held over a sensor for half a minute a fault:
+            // the flag latches until reset, so a test must not raise it.
+            continue;
+        }
+
         switch (u.event) {
         case gatelogic::GateEvent::BEE_IN:  countCrossing(g_total_in);  break;
         case gatelogic::GateEvent::BEE_OUT: countCrossing(g_total_out); break;
@@ -758,9 +783,18 @@ void getTelemetry(Telemetry& t) {
     // could not tell "all banks on" from "counter too old to say", and those
     // are opposite readings of the same flat totals.
     t.bank_mask        = g_banks.mask;
+    // Lifetime seconds in maintenance, including a session still running.
+    // Monotonic like the totals, so HiveHub can difference it: any increase
+    // over an interval means that interval's totals were frozen for a test.
+    t.maint_s          = maintstate::totalSeconds(g_maint, millis());
 }
 
-uint32_t applyIdleRequest(uint32_t duration_s) {
+}  // namespace ble
+
+// Apply a night-mode request immediately. ble::applyIdleRequest() below is the
+// HiveHub entry point and defers to this outside maintenance; ending a
+// maintenance session replays a deferred request through it.
+static uint32_t applyIdleNow(uint32_t duration_s) {
     const bool was_sensing = idlestate::sensing(g_idle);
     const idlestate::Request r =
         idlestate::request(g_idle, millis(), duration_s);
@@ -787,11 +821,8 @@ uint32_t applyIdleRequest(uint32_t duration_s) {
     return r.granted_s;
 }
 
-uint32_t idleRemainingSeconds() {
-    return idlestate::remainingSeconds(g_idle, millis());
-}
-
-uint8_t applyBankMask(uint8_t mask) {
+// Apply a bank mask immediately; the same split as applyIdleNow().
+static uint8_t applyBankMaskNow(uint8_t mask) {
     const bankstate::Request r = bankstate::request(g_banks, mask);
     if (!r.accepted) {
         // bank_state.h refuses an all-off mask rather than blinding the
@@ -820,6 +851,42 @@ uint8_t applyBankMask(uint8_t mask) {
     return r.granted;
 }
 
+namespace ble {
+
+uint32_t applyIdleRequest(uint32_t duration_s) {
+    if (!g_maint.active) return applyIdleNow(duration_s);
+    // Maintenance owns the emitters until it ends. Hold the request — clamped
+    // exactly as it would have been — and replay what is left of it then, so
+    // the counter still ends up where HiveHub wants it.
+    idlestate::State probe;
+    const uint32_t granted = idlestate::request(probe, millis(), duration_s).granted_s;
+    maintstate::deferIdle(g_maint, millis(), granted);
+    slog::printf("[MAINT] HiveHub night mode %lus held until maintenance ends",
+                 (unsigned long)granted);
+    return granted;
+}
+
+uint32_t idleRemainingSeconds() {
+    return idlestate::remainingSeconds(g_idle, millis());
+}
+
+uint8_t applyBankMask(uint8_t mask) {
+    if (!g_maint.active) return applyBankMaskNow(mask);
+    // Validated by the same rules (an all-off mask is still refused), then
+    // held like a night-mode request.
+    bankstate::State probe = g_banks;
+    const bankstate::Request r = bankstate::request(probe, mask);
+    if (!r.accepted) {
+        slog::printf("[BANKS] request 0x%02X refused; still 0x%02X",
+                     (unsigned)mask, (unsigned)g_banks.mask);
+        return g_banks.mask;
+    }
+    maintstate::deferBanks(g_maint, r.granted);
+    slog::printf("[MAINT] HiveHub bank mask 0x%02X held until maintenance ends",
+                 (unsigned)r.granted);
+    return r.granted;
+}
+
 uint8_t bankMask() {
     return g_banks.mask;
 }
@@ -842,6 +909,30 @@ static void timedPoll() {
     pollAllGates();   // pulses the emitters internally in AUTO mode
     polltiming::notePoll(g_timing, start_us, (uint32_t)(micros() - start_us),
                          LATE_POLL_GAP_US);
+}
+
+// End a maintenance session and put back everything it overrode: LED mode,
+// bank mask (HiveHub's latest request if one arrived, else the mask at entry)
+// and any night-mode suspension, with only the time it has left.
+static void endMaintenance(const char* why) {
+    const uint32_t in = g_maint.test_in;
+    const uint32_t out = g_maint.test_out;
+    const uint32_t glitch = g_maint.test_glitch;
+    const uint32_t session_s = (millis() - g_maint.entered_ms) / 1000;
+    const maintstate::Restore r = maintstate::exit(g_maint, millis());
+
+    g_led_mode = LedMode::AUTO;
+    applyBankMaskNow(r.bank_mask);
+    // Test stimuli must not leave a half-finished pairing for real traffic to
+    // complete.
+    resetAllGates();
+    if (r.idle_s > 0) applyIdleNow(r.idle_s);
+
+    slog::printf("[MAINT] ended %s after %lus: test in=%lu out=%lu glitches=%lu; "
+                 "banks 0x%02X, night mode %lus",
+                 why, (unsigned long)session_s, (unsigned long)in,
+                 (unsigned long)out, (unsigned long)glitch,
+                 (unsigned)g_banks.mask, (unsigned long)r.idle_s);
 }
 
 // ----------------------------------------------------------------------------
@@ -940,6 +1031,211 @@ void statusView(StatusView& out) {
     out.window_late = g_timing.window.late;
     out.window_max_gap_us = g_timing.window.max_gap_us;
     out.window_max_poll_us = g_timing.window.max_duration_us;
+    out.maint = g_maint.active;
+}
+
+// ---- maintenance ----
+
+static Result maintGate() {
+    if (ble::isOtaActive()) return Result::OTA_ACTIVE;
+    if (!g_maint.active) return Result::NOT_IN_MAINT;
+    return Result::OK;
+}
+
+Result maintEnter() {
+    if (ble::isOtaActive()) return Result::OTA_ACTIVE;
+    if (g_maint.active) return Result::ALREADY;
+    const uint32_t now = millis();
+    // A night-mode suspension in force is taken over by the session (the
+    // bench needs the emitters) and resumed, with whatever time it has left,
+    // when the session ends.
+    const uint32_t idle_left = idlestate::remainingSeconds(g_idle, now);
+    if (idle_left > 0) applyIdleNow(0);
+    maintstate::enter(g_maint, now, g_banks.mask, idle_left);
+    // Nothing paired before the session may complete inside it.
+    resetAllGates();
+    slog::printf("[MAINT] started: totals frozen, crossings go to test counters, "
+                 "ends after %lus without a command",
+                 (unsigned long)(maintstate::TIMEOUT_MS / 1000));
+    return Result::OK;
+}
+
+Result maintExit() {
+    if (!g_maint.active) return Result::ALREADY;
+    endMaintenance("on request");
+    return Result::OK;
+}
+
+void maintTouch() {
+    maintstate::touch(g_maint, millis());
+}
+
+void maintView(MaintView& out) {
+    out = MaintView();
+    const uint32_t now = millis();
+    out.active = g_maint.active;
+    out.timeout_s = maintstate::timeoutRemainingSeconds(g_maint, now);
+    out.session_s = g_maint.active ? (now - g_maint.entered_ms) / 1000 : 0;
+    out.total_s = maintstate::totalSeconds(g_maint, now);
+    out.test_in = g_maint.test_in;
+    out.test_out = g_maint.test_out;
+    out.test_glitch = g_maint.test_glitch;
+    out.leds = g_led_mode == LedMode::FORCE_ON  ? LedSetting::ON
+             : g_led_mode == LedMode::FORCE_OFF ? LedSetting::OFF
+                                                : LedSetting::AUTO;
+    out.bank_mask = g_banks.mask;
+    if (g_maint.active) {
+        out.restore_mask = g_maint.banks_pending ? g_maint.banks_mask
+                                                 : g_maint.banks_before;
+        if (g_maint.idle_pending) {
+            const uint32_t elapsed_s = (now - g_maint.idle_requested_ms) / 1000;
+            out.restore_idle_s = elapsed_s < g_maint.idle_duration_s
+                ? g_maint.idle_duration_s - elapsed_s : 0;
+        }
+    }
+}
+
+Result setLeds(LedSetting setting) {
+    const Result gate = maintGate();
+    if (gate != Result::OK) return gate;
+    // Applied by loop()'s mode-change block, which sets the steady level.
+    g_led_mode = setting == LedSetting::ON  ? LedMode::FORCE_ON
+               : setting == LedSetting::OFF ? LedMode::FORCE_OFF
+                                            : LedMode::AUTO;
+    return Result::OK;
+}
+
+Result setBank(uint8_t bank, bool on) {
+    const Result gate = maintGate();
+    if (gate != Result::OK) return gate;
+    const uint8_t bit = bankstate::bankBit(bank);
+    if (bit == 0 || bank > pins::NUM_LED_BANKS) return Result::REFUSED;
+    const uint8_t mask = on ? (uint8_t)(g_banks.mask | bit)
+                            : (uint8_t)(g_banks.mask & ~bit);
+    if (mask == g_banks.mask) return Result::ALREADY;
+    // An all-off mask is refused here exactly as it is over BLE.
+    const uint8_t granted = applyBankMaskNow(mask);
+    if (granted != mask) return Result::REFUSED;
+    // The FETs were parked by applyBankMaskNow(); restore the mode's level.
+    setIrLeds(true);
+    return Result::OK;
+}
+
+Result i2cScan(I2cScanView& out) {
+    out = I2cScanView();
+    const Result gate = maintGate();
+    if (gate != Result::OK) return gate;
+    // ~126 empty address phases: a few milliseconds of bus time, which is why
+    // this is a maintenance command — counting is paused anyway.
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        if (!mcpPresent(addr)) continue;
+        if (out.count < sizeof(out.addrs)) out.addrs[out.count] = addr;
+        out.count++;
+    }
+    return Result::OK;
+}
+
+// MCP23017 register addresses with IOCON.BANK = 0. IODIRA..GPPUB are 0x00..0x0D,
+// so one sequential 14-byte read covers every configuration register.
+static constexpr uint8_t MCP_REG_IODIRA = 0x00;
+static constexpr uint8_t MCP_CONFIG_BYTES = 14;
+static constexpr uint16_t MCP_TEST_BURST = 100;
+
+Result mcpTest(McpTestView (&out)[NUM_CHIPS]) {
+    const Result gate = maintGate();
+    if (gate != Result::OK) return gate;
+    for (uint8_t i = 0; i < NUM_MCP && i < NUM_CHIPS; i++) {
+        McpHealth& m = g_mcp[i];
+        McpTestView& v = out[i];
+        v = McpTestView();
+        v.name = m.name;
+        v.addr = m.addr;
+        v.present = mcpPresent(m.addr);
+        if (!v.present) continue;
+
+        uint8_t r[MCP_CONFIG_BYTES] = {0};
+        Wire.beginTransmission(m.addr);
+        Wire.write(MCP_REG_IODIRA);
+        if (Wire.endTransmission(false) == 0 &&
+            Wire.requestFrom((int)m.addr, (int)MCP_CONFIG_BYTES) == MCP_CONFIG_BYTES) {
+            for (uint8_t k = 0; k < MCP_CONFIG_BYTES; k++) r[k] = (uint8_t)Wire.read();
+            v.regs_read = true;
+            v.iodir_a = r[0x00];
+            v.iodir_b = r[0x01];
+            v.ipol_a  = r[0x02];
+            v.ipol_b  = r[0x03];
+            v.iocon   = r[0x0A];
+            v.gppu_a  = r[0x0C];
+            v.gppu_b  = r[0x0D];
+            v.config_ok = diagfmt::mcpConfigOk(v.iodir_a, v.iodir_b, v.ipol_a,
+                                               v.ipol_b, v.gppu_a, v.gppu_b,
+                                               v.iocon);
+        }
+
+        // The same checked two-byte read the sampler does, back to back. Its
+        // statistics are real reads and stay in the chip's McpStats too.
+        const McpStats before = m.stats;
+        for (uint16_t k = 0; k < MCP_TEST_BURST; k++) {
+            uint16_t word = 0;
+            const uint32_t t0 = micros();
+            const bool ok = readMcpChecked(i, word);
+            const uint32_t dt = (uint32_t)(micros() - t0);
+            v.burst++;
+            if (ok) {
+                v.burst_ok++;
+                if (dt > v.burst_max_us) v.burst_max_us = dt;
+            }
+        }
+        v.burst_nack = (uint16_t)(m.stats.nacks - before.nacks);
+        v.burst_short = (uint16_t)(m.stats.short_reads - before.short_reads);
+    }
+    return Result::OK;
+}
+
+static SensorView viewOf(bool read_ok, uint16_t word, uint8_t pin) {
+    if (!read_ok) return SensorView::INVALID;
+    return ((word >> pin) & 1) ? SensorView::CLEAR : SensorView::BLOCKED;
+}
+
+Result darkLit(DarkLitView* out, uint8_t n) {
+    const Result gate = maintGate();
+    if (gate != Result::OK) return gate;
+
+    uint16_t dark[NUM_MCP] = {0};
+    uint16_t lit[NUM_MCP] = {0};
+    bool dark_ok[NUM_MCP] = {false};
+    bool lit_ok[NUM_MCP] = {false};
+
+    // Dark first, then lit, each after the same settle time the sampler uses.
+    // driveIrLeds() honours the bank mask, so a disabled bank stays dark for
+    // both and is reported as such below.
+    driveIrLeds(false);
+    delayMicroseconds(LED_SETTLE_US);
+    for (uint8_t i = 0; i < NUM_MCP; i++) dark_ok[i] = readMcpChecked(i, dark[i]);
+    driveIrLeds(true);
+    delayMicroseconds(LED_SETTLE_US);
+    for (uint8_t i = 0; i < NUM_MCP; i++) lit_ok[i] = readMcpChecked(i, lit[i]);
+    setIrLeds(true);   // back to the LED mode's own steady level
+
+    for (uint8_t g = 0; g < n && g < gates::NUM_GATES; g++) {
+        const auto& loc = gates::TABLE[g];
+        DarkLitView& v = out[g];
+        v = DarkLitView();
+        v.tag = loc.tag;
+        v.bank = loc.led_bank;
+        const int8_t ch = mcpIndexForAddress(loc.mcp_address);
+        if (!bankstate::enabled(g_banks, loc.led_bank)) {
+            v.inner_dark = v.inner_lit = v.outer_dark = v.outer_lit =
+                SensorView::BANK_OFF;
+            continue;
+        }
+        if (ch < 0) continue;   // left INVALID
+        v.inner_dark = viewOf(dark_ok[ch], dark[ch], loc.inner_pin);
+        v.outer_dark = viewOf(dark_ok[ch], dark[ch], loc.outer_pin);
+        v.inner_lit  = viewOf(lit_ok[ch],  lit[ch],  loc.inner_pin);
+        v.outer_lit  = viewOf(lit_ok[ch],  lit[ch],  loc.outer_pin);
+    }
+    return Result::OK;
 }
 
 }  // namespace diag
@@ -1019,6 +1315,17 @@ void loop() {
         resetAllGates();
         g_status_flags &= (uint8_t)~beecounter_proto::STATUS_NIGHT_IDLE;
         slog::printf("[IDLE] suspension expired; counting again");
+    }
+
+    // A maintenance session ends by itself when an OTA starts (the transfer
+    // owns the counter, and the new image would boot out of it anyway) or
+    // when nobody has typed a command for maintstate::TIMEOUT_MS.
+    if (g_maint.active) {
+        if (ble::isOtaActive()) {
+            endMaintenance("for a firmware update");
+        } else if (maintstate::timedOut(g_maint, now)) {
+            endMaintenance("after inactivity timeout");
+        }
     }
 
     if (ble::isOtaActive()) {

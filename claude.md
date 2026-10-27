@@ -71,6 +71,10 @@ backend.
   debug image. Never print with `Serial.print*()` — use `slog::printf()`, which
   drops a line rather than stall the 5 ms sampler when the USB host is not
   reading.
+- **Maintenance mode fails open, like night mode.** The USB console's
+  `maint on` freezes the totals and holds HiveHub's requests back, so it must
+  always end: 30 min without a command, an OTA, or a reset. Never persist it,
+  and never let a maintenance-only command run outside a session.
 - **Bump `HIVETRAFFIC_FW_VERSION` in `include/version.h` for every released
   image.** HiveHub refuses an OTA relay that isn't newer, and uses the same
   field afterwards to confirm the update took.
