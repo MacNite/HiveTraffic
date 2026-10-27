@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build and run the host-side logic tests.
 #
-# These cover the two pure headers, neither of which needs an ESP32, an
+# These cover the pure headers, none of which needs an ESP32, an
 # MCP23017 or a bee:
 #
 #   * include/gate_logic.h      — sensor debounce, the per-gate crossing state
@@ -15,7 +15,12 @@
 #   * include/bank_state.h      — the emitter-bank enable mask, whose mistakes
 #                                 are eight gates that silently stop counting;
 #   * include/device_name.h     — the advertised BLE name, whose address suffix
-#                                 is how a person tells two counters apart.
+#                                 is how a person tells two counters apart;
+#   * include/log_line.h        — the USB log's "whole lines or nothing" rule,
+#                                 which keeps a stalled terminal from stalling
+#                                 the gate sampler;
+#   * include/poll_timing.h     — the poll-gap record that makes such a stall
+#                                 visible, across pauses and micros() rollover.
 #
 # Everything hardware-facing stays in src/main.cpp and is still verified on the
 # bench (see the IR_DEBUG console in the README).
@@ -65,3 +70,17 @@ trap 'rm -rf "$OUT"' EXIT
     -o "$OUT/test_device_name"
 
 "$OUT/test_device_name"
+
+"$CXX" -std=c++11 -Wall -Wextra -Werror \
+    -I include \
+    test/test_log_line/test_log_line.cpp \
+    -o "$OUT/test_log_line"
+
+"$OUT/test_log_line"
+
+"$CXX" -std=c++11 -Wall -Wextra -Werror \
+    -I include \
+    test/test_poll_timing/test_poll_timing.cpp \
+    -o "$OUT/test_poll_timing"
+
+"$OUT/test_poll_timing"

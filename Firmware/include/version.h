@@ -14,4 +14,4 @@
 // and it is the only way to confirm afterwards that an update actually took.
 //
 // Bump this on every released image.
-#define HIVETRAFFIC_FW_VERSION "0.3.1"
+#define HIVETRAFFIC_FW_VERSION "0.3.2"

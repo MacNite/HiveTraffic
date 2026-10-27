@@ -120,6 +120,47 @@ still correct as written. Do not read the board's silk numbers as GPIO numbers �
 they differ (silk D4 is GPIO22). USB CDC is enabled in `platformio.ini`, so
 `Serial` output comes out over USB without an external UART bridge.
 
+### USB serial output never waits
+
+Every log line goes through `slog::printf()` (`src/serial_log.cpp`), never
+through `Serial.print*()` directly, and it never blocks. A line that does not
+fit the 4 KiB USB TX buffer right now is **dropped and counted**. The Arduino
+USB driver normally waits up to 100 ms per write (and retries up to 20 times)
+whenever a host is attached but not reading: a paused terminal, a sleeping
+laptop. That is long enough to miss crossings, because the gates are sampled
+every 5 ms and a bee spends only ~12 ms in a beam. So `slog::begin()` sets the
+driver's TX timeout to zero, which also covers the ESP-IDF `log_i/log_w` output
+that shares the port. Lines are written whole or not at all, so a dropped line
+never splices into the next one (`include/log_line.h`).
+
+The firmware also measures whether the sampler really runs every 5 ms
+(`include/poll_timing.h`): the gap between consecutive polls and how long each
+poll takes. Deliberate pauses (night mode, OTA) are not counted as gaps. A
+`[TIMING]` line follows the 30 s `[STAT]` line **only when something was
+wrong** in that window. A healthy counter's log looks exactly as before.
+
+```
+[TIMING] polls=5821 late=3 max_gap=41234us max_poll=1690us log_dropped=0 (boot: late=3 max_gap=41234us)
+```
+
+* `late`: polls that started more than two intervals (10 ms) after the
+  previous one. These are what can cost a crossing.
+* `max_gap` / `max_poll`: longest gap between poll starts, and longest single
+  poll (which bounds the lit emitter window), in this window.
+* `log_dropped`: lines dropped since the last `[TIMING]` line because the
+  USB host was not reading.
+
+To check a build on the bench, let it run with BLE active in each of these
+three states for a few minutes, then read the log:
+
+1. no USB host at all (powered from a charger);
+2. `pio device monitor` attached and reading;
+3. `pio device monitor` attached but suspended with `Ctrl-Z` for a minute
+   or two (it then stops reading the port), then resumed with `fg`.
+
+Case 3 should produce `log_dropped>0` after the resume and **no** `late`
+polls. Any `late` polls point at something other than the log.
+
 The build uses `partitions_4mb_ota_no_fs.csv` — two 2 MB app slots so BLE OTA
 can write the inactive one. The table sums to exactly 4 MB, which is the flash
 the XIAO board profile declares. A counter still running a pre-BLE image was
@@ -327,7 +368,7 @@ Easy Bee Counter 2026 — firmware booting (BLE/GATT link)
 [MCP] U2 (gates 00..07) @ 0x20: OK
 [MCP] U3 (gates 10..17) @ 0x21: OK
 [MCP] U4 (gates 20..27) @ 0x22: OK
-[BLE] HiveTraffic-AB:12 0.3.1 advertising for HiveHub
+[BLE] HiveTraffic-AB:12 0.3.2 advertising for HiveHub
 [SETUP] Entering normal counting loop (pulsed IR)
 ```
 
