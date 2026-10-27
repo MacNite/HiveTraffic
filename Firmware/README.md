@@ -305,6 +305,50 @@ An empty tunnel and a dead emitter both read `none`. Only a target, or a
 fixture, in front of the sensor tells them apart. A whole bank reading `none`
 with targets present points at that bank's FET or supply.
 
+### Guided gate test
+
+[`tools/gate_test.py`](tools/gate_test.py) runs the whole bench check over the
+console for you and walks you through it, gate by gate. You need a target, and
+a strip of white paper is enough. Run it with the housing fitted, because
+reflections and crosstalk between neighbouring gates depend on it.
+
+```bash
+pip install pyserial
+python3 tools/gate_test.py --port /dev/ttyACM0               # all 24 gates
+python3 tools/gate_test.py --port COM5 --gates 10-17 --csv u3.csv
+```
+
+Close any other serial monitor first; only one program can hold the port.
+The script starts a maintenance session, so the counter's lifetime totals
+are never touched, and always ends it again, including on Ctrl-C.
+
+1. **Bus:** `i2c scan` must find exactly `0x20`, `0x21` and `0x22`, and
+   `mcp test` must pass for U2, U3 and U4.
+2. **Empty-tunnel baseline:** `darklit` with nothing in any tunnel. Every
+   sensor must read `none`. `ambient` means sunlight or an input stuck low;
+   `reflects` means something in the empty tunnel reflects.
+3. **Per gate**, each step prompted and confirmed with Enter (`s` skips a step,
+   `q` stops):
+   * target over the inner sensor, then away: must give `inner_block` then
+     `inner_clear` on this gate;
+   * the same for the outer sensor;
+   * target held over both sensors: `darklit` must say `reflects` for both,
+     so the response comes from the gate's own emitter;
+   * target passed outside → inside, then inside → outside: must count
+     `bee_in`, then `bee_out`, on this gate.
+
+   Events on *other* gates during a step are listed as crosstalk notes.
+
+The report has one row per gate, with each check and an overall
+`PASS` / `FAIL` / `NOT TESTED`, plus the bus results. `--csv` also writes it
+to a file. The exit code is 0 when nothing failed, and 3 when something did.
+`--skip-direction` leaves out the two pass-through checks. `--timeout` sets
+how long each step waits for you (default 20 s). `--verbose` echoes every
+console line.
+
+The script needs firmware 0.5.0 or later (the maintenance commands) and
+refuses older firmware at the start.
+
 ---
 
 ## Tuning
@@ -406,6 +450,9 @@ No ESP32, no MCP23017 and no bee required.
   sized without it. The suite pins the refusal of an all-off mask, the
   one-based bank numbering that `gates::TABLE[].led_bank` depends on, and the
   masking of bits above the last physical bank.
+* **`tools/gate_test.py`**: the guided bench gate test, run against a
+  simulated counter that prints the console's exact line formats. A change to
+  a console line on either side shows up here, not on the bench.
 * **`include/maint_state.h`** — maintenance sessions: the inactivity timeout,
   the replay of HiveHub's deferred night-mode and bank requests (a suspension
   resumes with only its remaining time), and the monotonic `maint_s` figure.

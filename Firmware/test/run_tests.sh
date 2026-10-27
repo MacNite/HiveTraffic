@@ -30,7 +30,9 @@
 #                                 check;
 #   * include/maint_state.h     — maintenance sessions: the inactivity timeout,
 #                                 the replay of HiveHub's deferred requests and
-#                                 the maint_s figure.
+#                                 the maint_s figure;
+#   * tools/gate_test.py        — the guided bench gate test, run against a
+#                                 simulated console (python3, no hardware).
 #
 # Everything hardware-facing stays in src/main.cpp and is still verified on the
 # bench (see the USB diagnostic console in the README).
@@ -54,3 +56,7 @@ for t in gate_logic measurement_json idle_state bank_state device_name \
         -o "$OUT/test_$t"
     "$OUT/test_$t"
 done
+
+# The bench gate-test script (tools/gate_test.py), against a simulated
+# counter that prints the console's exact line formats. Needs only python3.
+python3 -m unittest discover -s tools -p 'test_*.py'

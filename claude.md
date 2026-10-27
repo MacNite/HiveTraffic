@@ -50,6 +50,9 @@ backend.
   - `include/bank_state.h` — the emitter-bank (MOSFET) enable mask, as pure
     bitmask rules.
   - `include/pins.h` — **authoritative** GPIO map for the PCB.
+  - `tools/gate_test.py` — guided bench test of all 24 gates over the USB
+    console (pyserial). Its tests run a simulated console with the firmware's
+    exact line formats: change a console line, update both.
   - `include/counter_protocol.h` — status bitfield + OTA state codes shared
     between `main.cpp` and `ble_link.cpp`.
   - `include/version.h` — image version reported over BLE.
