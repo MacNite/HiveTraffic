@@ -9,6 +9,7 @@
 #include "counter_protocol.h"
 #include "device_name.h"
 #include "measurement_json.h"
+#include "serial_log.h"
 #include "version.h"
 
 namespace ble {
@@ -115,7 +116,7 @@ static void refreshMeasurement(NimBLECharacteristic* characteristic) {
     const int length = buildMeasurementJson(json, sizeof(json), t,
                                             HIVETRAFFIC_FW_VERSION);
     if (length <= 0) {
-        Serial.println(F("[BLE] measurement serialization failed"));
+        slog::printf("[BLE] measurement serialization failed");
         return;
     }
     characteristic->setValue(reinterpret_cast<const uint8_t*>(json), length);
@@ -153,7 +154,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
             otaRunningCrc = 0xFFFFFFFFUL;
             otaRebootAt = 0;
             if (otaSize == 0 || !Update.begin(otaSize)) {
-                Serial.printf("[BLE-OTA] BEGIN rejected: size=%lu error=%s\n",
+                slog::printf("[BLE-OTA] BEGIN rejected: size=%lu error=%s\n",
                               static_cast<unsigned long>(otaSize),
                               Update.errorString());
                 failOta(OTA_STATE_ERR_BEGIN);
@@ -162,7 +163,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
             otaError = OTA_ERR_NONE;
             otaState = OTA_STATE_RECEIVING;
             publishOtaStatus();
-            Serial.printf("[BLE-OTA] receiving %lu bytes, crc=0x%08lX\n",
+            slog::printf("[BLE-OTA] receiving %lu bytes, crc=0x%08lX\n",
                           static_cast<unsigned long>(otaSize),
                           static_cast<unsigned long>(otaExpectedCrc));
             break;
@@ -188,7 +189,7 @@ class OtaControlCallbacks : public NimBLECharacteristicCallbacks {
             otaError = OTA_ERR_NONE;
             otaRebootAt = millis() + OTA_REBOOT_DELAY_MS;
             publishOtaStatus();
-            Serial.println(F("[BLE-OTA] verified; reboot scheduled"));
+            slog::printf("[BLE-OTA] verified; reboot scheduled");
             break;
         }
         case OTA_OP_ABORT:
@@ -258,7 +259,7 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
         switch (data[0]) {
         case CTRL_OP_SET_IDLE: {
             if (value.size() != CTRL_SET_IDLE_LENGTH) {
-                Serial.printf("[BLE-CTRL] SET_IDLE ignored: %u bytes, expected %u\n",
+                slog::printf("[BLE-CTRL] SET_IDLE ignored: %u bytes, expected %u\n",
                               (unsigned)value.size(),
                               (unsigned)CTRL_SET_IDLE_LENGTH);
                 return;
@@ -270,7 +271,7 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
             // the state is not persisted. Rejecting keeps the two mechanisms
             // from having an opinion about each other at all.
             if (isOtaActive()) {
-                Serial.println(F("[BLE-CTRL] SET_IDLE refused: OTA in progress"));
+                slog::printf("[BLE-CTRL] SET_IDLE refused: OTA in progress");
                 return;
             }
             const uint32_t duration_s =
@@ -278,29 +279,29 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
                 ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
             const uint32_t granted = applyIdleRequest(duration_s);
             if (granted != duration_s) {
-                Serial.printf("[BLE-CTRL] idle %lus requested, %lus granted (cap %lus)\n",
+                slog::printf("[BLE-CTRL] idle %lus requested, %lus granted (cap %lus)\n",
                               (unsigned long)duration_s, (unsigned long)granted,
                               (unsigned long)MAX_IDLE_SECONDS);
             } else if (granted == 0) {
-                Serial.println(F("[BLE-CTRL] idle 0s: sensing resumed"));
+                slog::printf("[BLE-CTRL] idle 0s: sensing resumed");
             } else {
-                Serial.printf("[BLE-CTRL] sensing suspended for %lus\n",
+                slog::printf("[BLE-CTRL] sensing suspended for %lus\n",
                               (unsigned long)granted);
             }
             break;
         }
         case CTRL_OP_RESUME:
             if (value.size() != 1) {
-                Serial.printf("[BLE-CTRL] RESUME ignored: %u bytes, expected 1\n",
+                slog::printf("[BLE-CTRL] RESUME ignored: %u bytes, expected 1\n",
                               (unsigned)value.size());
                 return;
             }
             applyIdleRequest(0);
-            Serial.println(F("[BLE-CTRL] sensing resumed"));
+            slog::printf("[BLE-CTRL] sensing resumed");
             break;
         case CTRL_OP_SET_BANKS: {
             if (value.size() != CTRL_SET_BANKS_LENGTH) {
-                Serial.printf("[BLE-CTRL] SET_BANKS ignored: %u bytes, expected %u\n",
+                slog::printf("[BLE-CTRL] SET_BANKS ignored: %u bytes, expected %u\n",
                               (unsigned)value.size(),
                               (unsigned)CTRL_SET_BANKS_LENGTH);
                 return;
@@ -312,16 +313,16 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
             // by one. The emitters are dark for the transfer either way.
             const uint8_t granted = applyBankMask(data[1]);
             if (granted != data[1]) {
-                Serial.printf("[BLE-CTRL] banks 0x%02X requested, 0x%02X in force\n",
+                slog::printf("[BLE-CTRL] banks 0x%02X requested, 0x%02X in force\n",
                               (unsigned)data[1], (unsigned)granted);
             } else {
-                Serial.printf("[BLE-CTRL] emitter banks set to 0x%02X\n",
+                slog::printf("[BLE-CTRL] emitter banks set to 0x%02X\n",
                               (unsigned)granted);
             }
             break;
         }
         default:
-            Serial.printf("[BLE-CTRL] unknown opcode 0x%02X ignored\n",
+            slog::printf("[BLE-CTRL] unknown opcode 0x%02X ignored\n",
                           (unsigned)data[0]);
             break;
         }
@@ -346,16 +347,16 @@ class ControlCallbacks : public NimBLECharacteristicCallbacks {
 
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
-        Serial.println(F("[BLE] HiveHub connected"));
+        slog::printf("[BLE] HiveHub connected");
     }
     void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason) override {
         // A vanished relay must not leave gate sampling paused indefinitely.
         // The inactive partition is disposable; the running slot is untouched.
         if (otaState == OTA_STATE_RECEIVING) {
             failOta(OTA_STATE_ERR_SEQ);
-            Serial.println(F("[BLE-OTA] transfer aborted on disconnect"));
+            slog::printf("[BLE-OTA] transfer aborted on disconnect");
         }
-        Serial.printf("[BLE] disconnected (reason %d)\n", reason);
+        slog::printf("[BLE] disconnected (reason %d)\n", reason);
     }
 };
 
@@ -391,14 +392,14 @@ void buildDeviceName() {
         deviceName[0] = '\0';
     }
     if (!haveAddress) {
-        Serial.println(F("[BLE] no address available; advertising unsuffixed name"));
+        slog::printf("[BLE] no address available; advertising unsuffixed name");
     }
 
     // Keep the GAP Device Name characteristic in step with the advertised one,
     // so a client that connects and reads it — rather than trusting the scan
     // response — sees the same identity.
     if (!NimBLEDevice::setDeviceName(deviceName)) {
-        Serial.println(F("[BLE] GAP device name not updated"));
+        slog::printf("[BLE] GAP device name not updated");
     }
 }
 
@@ -480,12 +481,12 @@ void begin() {
     if (!advertising->start()) {
         // Never fail silently: without this the only symptom is a counter that
         // HiveHub can never see, with nothing on the serial log to say why.
-        Serial.println(F("[BLE] ERROR: advertising failed to start"));
+        slog::printf("[BLE] ERROR: advertising failed to start");
         return;
     }
     // The name is logged, not just the version: it is what someone comparing
     // the serial console with a scan list on their phone needs to match up.
-    Serial.printf("[BLE] %s %s advertising for HiveHub\n", deviceName,
+    slog::printf("[BLE] %s %s advertising for HiveHub\n", deviceName,
                   HIVETRAFFIC_FW_VERSION);
 }
 
@@ -496,8 +497,9 @@ bool isOtaActive() {
 void loopOta() {
     if (otaRebootAt != 0 &&
         static_cast<int32_t>(millis() - otaRebootAt) >= 0) {
-        Serial.println(F("[BLE-OTA] rebooting into updated firmware"));
-        Serial.flush();
+        slog::printf("[BLE-OTA] rebooting into updated firmware");
+        // No Serial.flush(): with the log non-blocking it returns at once.
+        // The USB interrupt drains the TX ring on its own during this delay.
         delay(50);
         ESP.restart();
     }
