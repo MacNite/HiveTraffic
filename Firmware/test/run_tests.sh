@@ -20,10 +20,15 @@
 #                                 which keeps a stalled terminal from stalling
 #                                 the gate sampler;
 #   * include/poll_timing.h     — the poll-gap record that makes such a stall
-#                                 visible, across pauses and micros() rollover.
+#                                 visible, across pauses and micros() rollover;
+#   * include/console_line.h    — the USB console's line input and its strict
+#                                 command grammar;
+#   * include/event_ring.h      — the queue between the sampler and the
+#                                 console's event stream, and its visible gaps;
+#   * include/diag_format.h     — the console's glyphs and row layout.
 #
 # Everything hardware-facing stays in src/main.cpp and is still verified on the
-# bench (see the IR_DEBUG console in the README).
+# bench (see the USB diagnostic console in the README).
 #
 #     ./test/run_tests.sh
 #
@@ -36,51 +41,11 @@ CXX=${CXX:-c++}
 OUT=$(mktemp -d)
 trap 'rm -rf "$OUT"' EXIT
 
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_gate_logic/test_gate_logic.cpp \
-    -o "$OUT/test_gate_logic"
-
-"$OUT/test_gate_logic"
-
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_measurement_json/test_measurement_json.cpp \
-    -o "$OUT/test_measurement_json"
-
-"$OUT/test_measurement_json"
-
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_idle_state/test_idle_state.cpp \
-    -o "$OUT/test_idle_state"
-
-"$OUT/test_idle_state"
-
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_bank_state/test_bank_state.cpp \
-    -o "$OUT/test_bank_state"
-
-"$OUT/test_bank_state"
-
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_device_name/test_device_name.cpp \
-    -o "$OUT/test_device_name"
-
-"$OUT/test_device_name"
-
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_log_line/test_log_line.cpp \
-    -o "$OUT/test_log_line"
-
-"$OUT/test_log_line"
-
-"$CXX" -std=c++11 -Wall -Wextra -Werror \
-    -I include \
-    test/test_poll_timing/test_poll_timing.cpp \
-    -o "$OUT/test_poll_timing"
-
-"$OUT/test_poll_timing"
+for t in gate_logic measurement_json idle_state bank_state device_name \
+         log_line poll_timing console_line event_ring diag_format; do
+    "$CXX" -std=c++11 -Wall -Wextra -Werror \
+        -I include \
+        "test/test_$t/test_$t.cpp" \
+        -o "$OUT/test_$t"
+    "$OUT/test_$t"
+done

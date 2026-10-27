@@ -40,7 +40,10 @@ backend.
 
 - `Firmware/` — PlatformIO project for the ESP32-C6 (`board = seeed_xiao_esp32c6`).
   - `src/main.cpp` — MCP polling loop, per-gate debounce/direction state machine,
-    pulsed IR emitter control, and the `-DIR_DEBUG` serial console.
+    pulsed IR emitter control.
+  - `src/diag_console.cpp` — the USB diagnostic console (passive: reports
+    what the sampler already read). `src/serial_log.cpp` — the non-blocking
+    USB log every line goes through.
   - `src/ble_link.cpp` — NimBLE GATT peripheral: the measurement characteristic,
     the night-mode control characteristic and the OTA characteristics.
   - `include/idle_state.h` — night-mode suspension as pure deadline arithmetic.
@@ -64,10 +67,10 @@ backend.
 ### Things to know before changing firmware
 
 - **One build environment** in `Firmware/platformio.ini`: `seeed_xiao_esp32c6`
-  (production). The interactive IR sensor console in `main.cpp` is gated behind
-  `-DIR_DEBUG`, has no environment of its own, and must never end up in the
-  production build; compile it ad hoc with
-  `PLATFORMIO_BUILD_FLAGS=-DIR_DEBUG pio run`.
+  (production). The USB diagnostic console is part of it; there is no separate
+  debug image. Never print with `Serial.print*()` — use `slog::printf()`, which
+  drops a line rather than stall the 5 ms sampler when the USB host is not
+  reading.
 - **Bump `HIVETRAFFIC_FW_VERSION` in `include/version.h` for every released
   image.** HiveHub refuses an OTA relay that isn't newer, and uses the same
   field afterwards to confirm the update took.

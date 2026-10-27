@@ -23,9 +23,8 @@ jobs:
         run: ./Firmware/test/run_tests.sh
 
   # The production image must compile from a clean dependency cache (every
-  # library is pinned in Firmware/platformio.ini), and the -DIR_DEBUG bench
-  # console must keep compiling too: it has no environment of its own, so
-  # nothing else would ever catch it going stale.
+  # library is pinned in Firmware/platformio.ini). The USB diagnostic console is
+  # part of that image, so there is no separate debug build to keep compiling.
   firmware-build:
     runs-on: ubuntu-latest
     steps:
@@ -35,14 +34,6 @@ jobs:
           python-version: "3.12"
       - name: Install PlatformIO
         run: pip install platformio
-      # The bench console runs first so the production image is what ends up in
-      # .pio/build for the upload below — an IR_DEBUG binary published as the
-      # release artifact would be flashable, plausible and wrong.
-      - name: Build the IR_DEBUG bench console
-        env:
-          PLATFORMIO_BUILD_FLAGS: -DIR_DEBUG
-        run: pio run
-        working-directory: Firmware
       - name: Build production image
         run: pio run
         working-directory: Firmware
