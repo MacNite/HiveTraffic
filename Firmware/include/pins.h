@@ -72,10 +72,10 @@
 // lost, see recoverI2cBus() in main.cpp), but only a board change makes these
 // pins in-spec. See "Known design risk" in the top-level README.
 //
-// In the Adafruit_MCP23X17 library, digitalRead(0..7) -> port A,
-// digitalRead(8..15) -> port B, so:
-//   inner sensor of gate K -> mcp.digitalRead(K)        // 0..7
-//   outer sensor of gate K -> mcp.digitalRead(K + 8)    // 8..15
+// The firmware reads each chip as one 16-bit word, GPIOA in the low byte and
+// GPIOB in the high byte, so:
+//   inner sensor of gate K -> bit K       // 0..7
+//   outer sensor of gate K -> bit K + 8   // 8..15
 //
 // QRE1113 wiring on this board:
 //   - Each phototransistor collector goes to its MCP pin, with a 100k

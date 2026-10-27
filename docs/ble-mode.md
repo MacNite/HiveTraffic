@@ -130,11 +130,13 @@ glitches than it did on the previous read, and the 16-bit ceiling it used to pin
 at is reachable in a day on a genuinely noisy device.
 
 `uptime_s` is seconds since boot, and its only real job is to show that the
-device restarted when you did not expect it to. It is 32-bit; the practical
-limit is not the field but `millis()`, which rolls over after about 49.7 days,
-so the value restarts then too. (Before protocol v3 the field was 16-bit and
-clamped at 65535 — 18 h 12 min — which meant an always-on counter reported one
-constant number for its entire deployment and could not do that job at all.)
+device restarted when you did not expect it to. It is 32-bit (about 136 years)
+and, since firmware 0.5.1, comes from the 64-bit `esp_timer` clock, so it goes
+back only on a real reset. (Before 0.5.1 it was derived from `millis()` and
+restarted every ~49.7 days on a counter that never rebooted. Before protocol v3
+the field was 16-bit and clamped at 65535 — 18 h 12 min — which meant an
+always-on counter reported one constant number for its entire deployment and
+could not do that job at all.)
 
 `mcps_healthy` counts the MCP23017 expanders currently answering on the I2C bus,
 so it ranges 0..3 while `num_gates` is 24; each healthy chip covers eight gates.

@@ -505,6 +505,19 @@ skipped (not counted as blocked) while it is down. If it never recovers, check:
 - That the 4.7 k pull-ups R4/R5 are populated.
 - That the chip's VDD pin 9 is at 3.3 V and VSS pin 10 is at GND.
 
+Every chip is configured with plain register writes and then read back, so
+`configuration not confirmed` means the chip answered on its address but its
+registers did not hold what was written (a marginal bus, or the wrong part); it
+is retried like a missing chip, and only marked `recovered` once its registers
+read back right. `no expander answering; bus recovery before each re-probe`
+means all three were lost at once: the firmware then clocks the I²C bus free
+before every retry (see "Known design risk" in the top-level README).
+
+`[BLE] ERROR: advertising failed to start; retrying` means the counter is not
+visible to HiveHub for the moment. While disconnected the firmware checks every
+second that it is advertising, restarts it if not (backing off to once a minute
+while restarts keep failing) and logs `advertising restarted` when it works.
+
 After boot, type `events on` and pass something reflective (a piece of
 paper) through a gate, outer side first: the gate's `outer_block`, then
 `inner_block`, then a `bee_in` should appear at once, and the totals on the

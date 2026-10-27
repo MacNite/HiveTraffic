@@ -71,6 +71,10 @@ uint8_t applyBankMask(uint8_t mask);
 uint8_t bankMask();
 
 void begin();
+// Called from loop(): restarts advertising if a disconnected counter is not
+// advertising (a failed start in begin(), or a failed restart after a
+// disconnect), with backoff while it keeps failing.
+void serviceAdvertising();
 bool isOtaActive();
 void loopOta();
 

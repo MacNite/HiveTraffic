@@ -38,6 +38,11 @@ constexpr char CHR_OTA_DATA[] = "8e8b0111-7a1c-4b9e-9a2f-1d6e0b9c1a01";
 constexpr char CHR_OTA_STATUS[] = "8e8b0113-7a1c-4b9e-9a2f-1d6e0b9c1a01";
 constexpr uint16_t ADV_INTERVAL_UNITS = 1600;  // 1600 * 0.625 ms = 1 second
 constexpr uint32_t OTA_REBOOT_DELAY_MS = 1500;
+// Advertising watchdog (serviceAdvertising()): how often a disconnected counter
+// checks that it is still advertising, and the longest it waits between restart
+// attempts once they start failing.
+constexpr uint32_t ADV_CHECK_INTERVAL_MS = 1000;
+constexpr uint32_t ADV_RETRY_MAX_MS = 60000;
 // How often, at most, a DATA write refreshes the OTA status characteristic and
 // notifies subscribers.
 //
@@ -62,6 +67,9 @@ uint32_t otaExpectedCrc = 0;
 uint32_t otaRunningCrc = 0xFFFFFFFFUL;
 uint32_t otaRebootAt = 0;
 uint32_t otaLastNotifyMs = 0;
+uint32_t advNextCheckMs = 0;
+uint32_t advRetryMs = ADV_CHECK_INTERVAL_MS;   // doubles per failed attempt
+bool advFailing = false;
 // millis() of the BEGIN or of the last accepted DATA write; what the stall
 // timeout in loopOta() measures from (ota_session.h).
 uint32_t otaLastProgressMs = 0;
@@ -521,13 +529,46 @@ void begin() {
     if (!advertising->start()) {
         // Never fail silently: without this the only symptom is a counter that
         // HiveHub can never see, with nothing on the serial log to say why.
-        slog::printf("[BLE] ERROR: advertising failed to start");
+        // serviceAdvertising() keeps retrying from loop().
+        slog::printf("[BLE] ERROR: advertising failed to start; retrying");
+        advFailing = true;
         return;
     }
     // The name is logged, not just the version: it is what someone comparing
     // the serial console with a scan list on their phone needs to match up.
     slog::printf("[BLE] %s %s advertising for HiveHub\n", deviceName,
                   HIVETRAFFIC_FW_VERSION);
+}
+
+// A counter that is not advertising is invisible to HiveHub — to the
+// measurement read and to the OTA relay alike — and nothing else would ever
+// notice. The first start() in begin() and NimBLE's own restart after each
+// disconnect (advertiseOnDisconnect) can both fail, so loop() checks once a
+// second whether a disconnected counter is still advertising and restarts it
+// if not, backing off to once a minute while restarts keep failing.
+void serviceAdvertising() {
+    const uint32_t now = millis();
+    if (static_cast<int32_t>(now - advNextCheckMs) < 0) return;
+    advNextCheckMs = now + ADV_CHECK_INTERVAL_MS;
+
+    NimBLEServer* server = NimBLEDevice::getServer();
+    if (!server || server->getConnectedCount() > 0) return;
+    NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+    if (advertising->isAdvertising()) {
+        advFailing = false;
+        advRetryMs = ADV_CHECK_INTERVAL_MS;
+        return;
+    }
+    if (advertising->start()) {
+        slog::printf("[BLE] advertising restarted");
+        advFailing = false;
+        advRetryMs = ADV_CHECK_INTERVAL_MS;
+        return;
+    }
+    if (!advFailing) slog::printf("[BLE] ERROR: advertising restart failed; retrying");
+    advFailing = true;
+    advNextCheckMs = now + advRetryMs;
+    advRetryMs = advRetryMs >= ADV_RETRY_MAX_MS / 2 ? ADV_RETRY_MAX_MS : advRetryMs * 2;
 }
 
 bool isOtaActive() {

@@ -122,7 +122,7 @@ bool emitReportLine(unsigned n) {
                 "glitches=%lu status=0x%02X banks=0x%02X",
                 HIVETRAFFIC_FW_VERSION,
                 (unsigned)beecounter_proto::PROTOCOL_VERSION,
-                (unsigned long)(s.uptime_ms / 1000), (unsigned long)s.total_in,
+                (unsigned long)s.uptime_s, (unsigned long)s.total_in,
                 (unsigned long)s.total_out, (unsigned long)s.glitches,
                 (unsigned)s.status_flags, (unsigned)s.bank_mask);
             return true;
