@@ -60,6 +60,9 @@ backend.
   `fabrication/` gerbers and drill files.
 - `docs/ble-mode.md` — the canonical GATT contract: UUIDs, JSON fields,
   advertising layout, OTA framing.
+- `docs/bench-test.md` — bench test manual for `Firmware/tools/gate_test.py`:
+  setup, every prompt, and what each failure points at. Keep its example
+  output in step with the script.
 - `Data/` — sample plots and notes on what the counts mean (foraging peaks,
   orientation flights).
 - `OLD/` — archived Arduino sketches, Eagle/KiCad files, and build instructions
