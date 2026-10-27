@@ -64,6 +64,14 @@
 //   GPA0..GPA7 -> Inner sensor of gate N0..N7 (data line of QRE1113 pin 3)
 //   GPB0..GPB7 -> Outer sensor of gate N0..N7 (data line of QRE1113 pin 3)
 //
+// KNOWN DESIGN RISK — GPA7/GPB7 as inputs. Revision D of the MCP23017
+// datasheet (DS20001952D) makes GPA7 and GPB7 output-only: an input there that
+// changes level during a read can corrupt SDA. Gates 07, 17 and 27 use them for
+// both sensors. The firmware tolerates the consequences (a single bad word is
+// rejected by the debounce; a wedged bus is clocked free when every chip is
+// lost, see recoverI2cBus() in main.cpp), but only a board change makes these
+// pins in-spec. See "Known design risk" in the top-level README.
+//
 // In the Adafruit_MCP23X17 library, digitalRead(0..7) -> port A,
 // digitalRead(8..15) -> port B, so:
 //   inner sensor of gate K -> mcp.digitalRead(K)        // 0..7

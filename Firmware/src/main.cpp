@@ -518,6 +518,63 @@ static bool mcpPresent(uint8_t addr) {
     return Wire.endTransmission() == 0;
 }
 
+// The standard I2C bus clear, for a slave left holding SDA low part-way through
+// a byte: clock SCL until SDA is released (nine pulses finish any byte), send a
+// STOP, and hand the pins back to the controller. The datasheet's warning about
+// GPA7/GPB7 inputs (see pins.h) is exactly this kind of SDA disruption, and a
+// wedged bus would otherwise keep all 24 gates dark until a power cycle.
+// Takes ~150 us with the emitters dark.
+static void recoverI2cBus() {
+    Wire.end();
+    pinMode(pins::I2C_SDA, INPUT_PULLUP);
+    pinMode(pins::I2C_SCL, OUTPUT_OPEN_DRAIN);
+    digitalWrite(pins::I2C_SCL, HIGH);
+    delayMicroseconds(5);
+    for (uint8_t i = 0; i < 9 && digitalRead(pins::I2C_SDA) == LOW; i++) {
+        digitalWrite(pins::I2C_SCL, LOW);
+        delayMicroseconds(5);
+        digitalWrite(pins::I2C_SCL, HIGH);
+        delayMicroseconds(5);
+    }
+    // STOP: SDA low while SCL is low, then release SCL, then SDA.
+    digitalWrite(pins::I2C_SCL, LOW);
+    delayMicroseconds(5);
+    pinMode(pins::I2C_SDA, OUTPUT_OPEN_DRAIN);
+    digitalWrite(pins::I2C_SDA, LOW);
+    delayMicroseconds(5);
+    digitalWrite(pins::I2C_SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(pins::I2C_SDA, HIGH);
+    delayMicroseconds(5);
+    Wire.begin(pins::I2C_SDA, pins::I2C_SCL, (uint32_t)I2C_MASTER_HZ);
+}
+
+// When every expander is lost at once, the likely fault is the shared bus, not
+// three chips. Clear it then, and again once per MCP_RETRY_INTERVAL_MS for as
+// long as the outage lasts, so each round of re-probes runs on a freed bus.
+// A single chip that still answers proves the bus works, and nothing happens.
+static bool     g_bus_outage = false;
+static uint32_t g_bus_recover_at_ms = 0;
+
+static void serviceBusRecovery(uint32_t now_ms) {
+    bool all_lost = true;
+    for (uint8_t i = 0; i < NUM_MCP; i++) {
+        if (g_mcp[i].ok) all_lost = false;
+    }
+    if (!all_lost) {
+        g_bus_outage = false;
+        return;
+    }
+    if (!g_bus_outage) {
+        g_bus_outage = true;
+        g_bus_recover_at_ms = now_ms;
+        slog::printf("[MCP] no expander answering; bus recovery before each re-probe");
+    }
+    if ((int32_t)(now_ms - g_bus_recover_at_ms) < 0) return;
+    g_bus_recover_at_ms = now_ms + MCP_RETRY_INTERVAL_MS;
+    recoverI2cBus();
+}
+
 // Re-probe an unhealthy chip, at most once per MCP_RETRY_INTERVAL_MS. Runs with
 // the emitters dark, before the sampling window.
 static void retryMcp(uint8_t idx, uint32_t now_ms) {
@@ -626,6 +683,7 @@ static bool pollAllGates() {
 
     // Re-probe anything currently marked unhealthy. Done first, with the
     // emitters still dark, so a probe never lengthens the LED pulse.
+    serviceBusRecovery(now_ms);
     for (uint8_t i = 0; i < NUM_MCP; i++) {
         retryMcp(i, now_ms);
     }
