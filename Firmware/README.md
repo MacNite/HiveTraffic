@@ -59,11 +59,11 @@ The net names `/GPIO4`, `/GPIO5` and `/GPIO6` are labels only — they are **not
 
 The previous 2-FET build split U3's gates across banks 1 and 2 (00..13 / 14..27); banks now line up 1:1 with the expanders. `pins::IR_LED_BANK_EN[]` maps bank number − 1 to its GPIO, and `gates::TABLE[i].led_bank` gives each gate's bank.
 
-Driving the GPIO HIGH turns the bank's emitters on. In the default `LedMode::AUTO` the emitters are **pulsed**: all three banks are lit together only for the settle + MCP-read window of each poll (~1.75 ms at 100 kHz), then switched off until the next poll. This drops the emitter duty cycle from 100% to roughly 35% at  the default 5 ms poll interval, cutting average emitter current proportionally, with no change to detection behaviour. The IR_DEBUG console's `1` / `0` / `a` keys force steady-on, blackout and pulsed mode respectively for bench work.
+Driving the GPIO HIGH turns the bank's emitters on. In the default `LedMode::AUTO` the emitters are **pulsed**: all three banks are lit together only for the settle + MCP-read window of each poll (~1.75 ms at 100 kHz), then switched off until the next poll. This drops the emitter duty cycle from 100% to roughly 35% at  the default 5 ms poll interval, cutting average emitter current proportionally, with no change to detection behaviour.
 
 Each bank can also be **switched off entirely**, which is a separate control from the LED mode: HiveHub writes an enable bitmask to the control characteristic (`SET_BANKS`, protocol v5) and `include/bank_state.h` decides what is applied. One bank draws ~0.14 A at 3.3 V, two ~0.22 A, three ~0.30 A, so this is the coarsest and most effective power knob on the board — for an entrance narrower than 24 gates, or a supply that will not carry the full one.
 
-All three banks are enabled by default and after any reset; the mask is never persisted, and HiveHub re-asserts it every upload cycle. A mask of `0` is refused rather than applied. Gates on a dark bank are **skipped**, not read as "clear": an unpowered QRE1113 is a bare phototransistor under a 100 kΩ pull-up, and direct sun into the entrance can pull one low. The expander itself is still read and health-checked, so `mcps_healthy` keeps its meaning. The IR_DEBUG console's `4` / `5` / `6` keys toggle banks 1/2/3 for bench work.
+All three banks are enabled by default and after any reset; the mask is never persisted, and HiveHub re-asserts it every upload cycle. A mask of `0` is refused rather than applied. Gates on a dark bank are **skipped**, not read as "clear": an unpowered QRE1113 is a bare phototransistor under a 100 kΩ pull-up, and direct sun into the entrance can pull one low. The expander itself is still read and health-checked, so `mcps_healthy` keeps its meaning. The USB console's `status` command shows the mask in force, and `watch` shows a dark bank's gates as `-`.
 
 ### Counting
 
@@ -201,45 +201,62 @@ does not know.
 
 ---
 
-## USB IR-sensor debug console (bench bring-up)
+## USB diagnostic console
 
-For initial testing of the IR sensors over USB — with no HiveScale / I2C master
-attached — there is an interactive serial console in `main.cpp`. It has no
-environment of its own; compile it into the production build on demand:
+Every image has a diagnostic console on the USB serial port. Nothing has to be
+rebuilt or reflashed to troubleshoot a counter. Attach any terminal at
+115200 baud, type a command and press Enter:
 
 ```bash
-PLATFORMIO_BUILD_FLAGS=-DIR_DEBUG pio run -t upload
-pio device monitor    # 115200 baud
+pio device monitor --echo    # --echo shows what you type
 ```
 
-That build is identical to production but compiles in the console (gated behind
-`-DIR_DEBUG`, so it is **never** in the normal firmware). Note that the artifact
-keeps the production filename, so do not upload one of these to HiveHub.
-Press a single key in the serial monitor:
+The console is **passive**. Every command reports state the normal 5 ms
+sampler has already produced. None of them reads a sensor, lights an emitter
+or changes the totals, so watching a counter on a hive cannot change what it
+counts. Its output is paced (a few lines per loop pass, and only when the USB
+buffer has room for a whole line), so a terminal that stops reading loses
+console output, never sampler time.
 
-| Key | Action                                                            |
-| --- | ---------------------------------------------------------------- |
-| `r` | Read & print all 24 gates' inner/outer beam state once          |
-| `s` | Toggle continuous streaming (~200 ms)                          |
-| `1` | Force IR LEDs ON (steady)                                       |
-| `0` | Force IR LEDs OFF                                               |
-| `a` | IR LEDs AUTO (normal pulsed mode)                              |
-| `n` | Arm / clear a 60 s night-mode suspension (press again to resume) |
-| `4` | Toggle emitter bank 1 (GATE_00..07)                            |
-| `5` | Toggle emitter bank 2 (GATE_10..17)                            |
-| `6` | Toggle emitter bank 3 (GATE_20..27)                            |
-| `h` | Show the command list                                          |
+| Command | Shows |
+| --- | --- |
+| `help` | The command list and the glyph legend |
+| `status` | Firmware and protocol version, uptime, totals, glitches, status bits, bank mask, night-mode / OTA state, poll timing since boot and in the current 30 s window, dropped log lines and events |
+| `sensors` | One line per gate from the latest poll: raw / debounced state of both sensors, and the gate's state machine (`IDLE`, `OUTER_FIRST`, `INNER_FIRST`, `PAIRED`) |
+| `mcp` | Per MCP23017: healthy, last read, failure streak, last port word, age of the last good read, successful reads, NACKs, short reads, times lost / recovered, slowest read |
+| `watch [1-10]` | One compact line per period at N Hz (default 5). `watch off` stops it |
+| `events on` / `events off` | Every debounced sensor edge and every counted crossing or glitch, timestamped at the poll that saw it |
 
-The bank keys are `4`/`5`/`6` because the schematic labels those rails `/GPIO4`,
-`/GPIO5` and `/GPIO6` — misleading net names (they are physically GPIO19/20/18)
-but the ones silkscreened next to the FETs.
+Every line starts with a tag (`[CON]`, `[STATUS]`, `[GATE]`, `[MCP]`, `[W]`,
+`[EV]`), so it can be told apart from the ordinary log and parsed by a script.
 
-Each reading lists the raw MCP23017 port words, the current bank mask, plus a
-per-gate `BLOCK`/`clear` line for the inner and outer sensor. A gate whose bank
-is switched off prints `<bank disabled>` rather than a beam state. The emitters are pulsed on for every read
-regardless of the LED mode, so the readout is always valid. Wave a finger or a
-bee through a gate and you should see that gate's `inner`/`outer` flip to
-`BLOCK`.
+A `watch` line packs one glyph per sensor, with `|` between the three chips
+(gates 00–07, 10–17, 20–27):
+
+```
+[W] t=812.400 in=1043 out=1029 inner=........|..#.....|-------- outer=........|.##.....|--------
+```
+
+| Glyph | Meaning |
+| --- | --- |
+| `.` | clear (line HIGH) |
+| `#` | blocked or reflecting (line LOW) |
+| `-` | that gate's emitter bank is switched off, so it is not sampled |
+| `?` | its chip is unhealthy or failed its latest read |
+| `~` | not sampling right now (night mode or OTA), or no fresh read |
+
+`watch` shows raw readings at a few Hz and will miss a quick bee. `events`
+misses nothing. The sampler queues every edge at the full 5 ms rate into a
+256-entry buffer, and the console drains it as USB allows:
+
+```
+[EV] seq=118 t=815230 gate=GATE_12 ev=outer_block
+[EV] seq=119 t=815240 gate=GATE_12 ev=inner_block
+[EV] seq=120 t=815240 gate=GATE_12 ev=bee_in
+```
+
+If the buffer ever fills, the newest events are dropped, never the oldest. The
+gap shows as a jump in `seq`, followed by an `[EV] dropped=N` line.
 
 ---
 
@@ -352,7 +369,7 @@ No ESP32, no MCP23017 and no bee required.
   hold the whole name.
 
 Everything hardware-facing stays in `src/main.cpp` and is still verified on the
-bench with the IR-sensor console above.
+bench with the USB diagnostic console above.
 
 ---
 
@@ -368,8 +385,9 @@ Easy Bee Counter 2026 — firmware booting (BLE/GATT link)
 [MCP] U2 (gates 00..07) @ 0x20: OK
 [MCP] U3 (gates 10..17) @ 0x21: OK
 [MCP] U4 (gates 20..27) @ 0x22: OK
-[BLE] HiveTraffic-AB:12 0.3.2 advertising for HiveHub
+[BLE] HiveTraffic-AB:12 0.4.0 advertising for HiveHub
 [SETUP] Entering normal counting loop (pulsed IR)
+[CON] USB console ready - type 'help' and Enter
 ```
 
 A chip that shows `NOT FOUND` is not written off: the firmware re-probes it
@@ -382,11 +400,8 @@ skipped (not counted as blocked) while it is down. If it never recovers, check:
 - That the 4.7 k pull-ups R4/R5 are populated.
 - That the chip's VDD pin 9 is at 3.3 V and VSS pin 10 is at GND.
 
-After boot, breaking a gate's beam (e.g. with a piece of paper) should
-trigger a serial counter increase on the next 30 s status dump.
-
-The final boot line now reads:
-
-```
-[SETUP] Entering normal counting loop (pulsed IR)
-```
+After boot, type `events on` and pass something reflective (a piece of
+paper) through a gate, outer side first: the gate's `outer_block`, then
+`inner_block`, then a `bee_in` should appear at once, and the totals on the
+next 30 s `[STAT]` line go up by one. `mcp` shows whether all three chips are
+answering.

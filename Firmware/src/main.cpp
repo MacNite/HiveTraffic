@@ -32,6 +32,9 @@
 //   6. Runs on a subset of its three emitter banks on request, so an entrance
 //      narrower than 24 gates — or a supply that will not carry 24 — costs only
 //      the banks it uses. See the section below.
+//   7. Answers a passive diagnostic console on USB (src/diag_console.cpp):
+//      status, per-gate readings, MCP23017 statistics, a live view and an
+//      event stream, all read from what the sampler already produced.
 //
 // Emitter bank enables (protocol v5)
 // ----------------------------------
@@ -95,6 +98,8 @@
 #include "bank_state.h"
 #include "poll_timing.h"
 #include "serial_log.h"
+#include "diag.h"
+#include "diag_console.h"
 
 // The BLE/GATT transport: a connectable NimBLE GATT server serving the
 // measurement characteristic and the OTA characteristics. See ble_link.h.
@@ -154,6 +159,12 @@ static constexpr uint32_t SENSOR_STUCK_MS = 30000;
 // the debounce its two samples inside a ~12 ms beam dwell, anything longer
 // starts to eat into it. Used only for reporting — it changes no behaviour.
 static constexpr uint32_t LATE_POLL_GAP_US = 2 * POLL_INTERVAL_MS * 1000;
+
+// A gate's raw reading is reported as STALE on the console once its chip's last
+// good read is older than this. Twenty poll intervals: comfortably longer than
+// any normal jitter, short enough that a paused sampler is never mistaken for
+// a live one.
+static constexpr uint32_t SNAPSHOT_STALE_MS = 100;
 
 // How often the periodic [STAT] line (and, when there is something to say, the
 // [TIMING] line) is printed.
@@ -289,10 +300,26 @@ static constexpr uint8_t MCP23X17_REG_GPIOA = 0x12;
 
 static Adafruit_MCP23X17 g_mcp_dev[NUM_MCP];
 
+// Read statistics for the diagnostic console's `mcp` command. Counted by the
+// normal sampler as it goes; nothing extra is read to produce them. All
+// saturating.
+struct McpStats {
+    uint32_t reads_ok = 0;
+    uint32_t nacks = 0;          // address or register phase not acknowledged
+    uint32_t short_reads = 0;    // fewer than the two requested bytes
+    uint32_t lost = 0;           // times declared unhealthy
+    uint32_t recovered = 0;      // times re-probed back to healthy
+    uint32_t max_read_us = 0;    // slowest successful read
+    uint16_t last_word = 0;      // last successfully read port word
+    bool     have_ok = false;    // has any read ever succeeded?
+    uint32_t last_ok_ms = 0;     // millis() of that read
+};
+
 struct McpHealth {
     uint8_t     addr;
     uint8_t     status_bit;
     const char* tag;
+    const char* name;           // "U2", for compact console output
     bool        ok;             // chip is believed present and answering
     uint8_t     fail_streak;    // consecutive failed reads
     uint32_t    next_retry_ms;  // when to re-probe while !ok
@@ -302,16 +329,21 @@ struct McpHealth {
     // message is printed by pollAllGates() once the emitters are dark again,
     // so logging never lengthens an LED pulse.
     bool        report_lost;
+    McpStats    stats;
 };
 
 static McpHealth g_mcp[NUM_MCP] = {
     { i2c_addr::MCP_GATES_00_07, beecounter_proto::STATUS_MCP_U2_OK,
-      "U2 (gates 00..07)", false, 0, 0, 0, false, false },
+      "U2 (gates 00..07)", "U2", false, 0, 0, 0, false, false, McpStats() },
     { i2c_addr::MCP_GATES_10_17, beecounter_proto::STATUS_MCP_U3_OK,
-      "U3 (gates 10..17)", false, 0, 0, 0, false, false },
+      "U3 (gates 10..17)", "U3", false, 0, 0, 0, false, false, McpStats() },
     { i2c_addr::MCP_GATES_20_27, beecounter_proto::STATUS_MCP_U4_OK,
-      "U4 (gates 20..27)", false, 0, 0, 0, false, false },
+      "U4 (gates 20..27)", "U4", false, 0, 0, 0, false, false, McpStats() },
 };
+
+static void saturatingInc(uint32_t& v) {
+    if (v != UINT32_MAX) v++;
+}
 
 // gates::TABLE identifies a chip by I2C address; the health records are indexed.
 static int8_t mcpIndexForAddress(uint8_t addr) {
@@ -353,7 +385,7 @@ static void driveIrLeds(bool on) {
 }
 
 // Apply a steady LED state honouring the mode overrides. Used when the mode
-// changes (the IR_DEBUG console's '1'/'0'/'a' keys) and at boot. In AUTO mode the steady state is
+// changes and at boot. In AUTO mode the steady state is
 // OFF — the emitters are only lit transiently by the pulsed sampler — so a
 // call here with on=true while in AUTO is treated as "leave pulsing to the
 // sampler" and forces the steady level OFF.
@@ -423,15 +455,32 @@ static void resetAllGates() {
 
 // One checked 2-byte read of GPIOA/GPIOB. Unlike readGPIOAB() this reports bus
 // failures instead of silently returning 0x0000 ("all blocked").
+//
+// Also keeps the chip's read statistics (McpStats) — the failure kind and the
+// transaction time are only visible here, and recording them costs a couple of
+// increments and a micros() call.
 static bool readMcpChecked(uint8_t idx, uint16_t& out) {
-    const uint8_t addr = g_mcp[idx].addr;
-    Wire.beginTransmission(addr);
+    McpHealth& m = g_mcp[idx];
+    const uint32_t t0 = micros();
+    Wire.beginTransmission(m.addr);
     Wire.write(MCP23X17_REG_GPIOA);
-    if (Wire.endTransmission(false) != 0) return false;   // repeated start
-    if (Wire.requestFrom((int)addr, (int)2) != 2) return false;
+    if (Wire.endTransmission(false) != 0) {   // repeated start
+        saturatingInc(m.stats.nacks);
+        return false;
+    }
+    if (Wire.requestFrom((int)m.addr, (int)2) != 2) {
+        saturatingInc(m.stats.short_reads);
+        return false;
+    }
     const uint8_t a = (uint8_t)Wire.read();   // GPIOA -> inner sensors
     const uint8_t b = (uint8_t)Wire.read();   // GPIOB -> outer sensors
     out = (uint16_t)a | ((uint16_t)b << 8);
+    const uint32_t dt = (uint32_t)(micros() - t0);
+    saturatingInc(m.stats.reads_ok);
+    if (dt > m.stats.max_read_us) m.stats.max_read_us = dt;
+    m.stats.last_word = out;
+    m.stats.have_ok = true;
+    m.stats.last_ok_ms = millis();
     return true;
 }
 
@@ -449,6 +498,7 @@ static void noteMcpResult(uint8_t idx, bool read_ok, uint32_t now_ms) {
         g_status_flags &= (uint8_t)~m.status_bit;
         m.next_retry_ms = now_ms + MCP_RETRY_INTERVAL_MS;
         resetGatesForMcp(m.addr);
+        saturatingInc(m.stats.lost);
         // Called with the emitters lit: defer the message until they are dark.
         m.report_lost = true;
     }
@@ -482,6 +532,7 @@ static void retryMcp(uint8_t idx, uint32_t now_ms) {
     m.fail_streak = 0;
     g_status_flags |= m.status_bit;
     resetGatesForMcp(m.addr);
+    saturatingInc(m.stats.recovered);
     slog::printf("[MCP] %s @ 0x%02X: recovered\n", m.tag, m.addr);
 }
 
@@ -607,8 +658,39 @@ static bool pollAllGates() {
         const bool inner_blocked = !getBit(v, loc.inner_pin);
         const bool outer_blocked = !getBit(v, loc.outer_pin);
 
+        gatelogic::GateRuntime& rt = g_gate_rt[i];
+        const bool inner_was = rt.inner.accepted;
+        const bool outer_was = rt.outer.accepted;
+
         const gatelogic::GateUpdate u = gatelogic::updateGate(
-            g_gate_rt[i], inner_blocked, outer_blocked, now_ms, GATE_TUNING);
+            rt, inner_blocked, outer_blocked, now_ms, GATE_TUNING);
+
+        // Debounced edges and counted crossings for the console's `events`
+        // stream. A copy into a ring, and only while someone asked for it.
+        if (console::eventsEnabled()) {
+            if (rt.inner.accepted != inner_was) {
+                console::noteEvent(now_ms, i, rt.inner.accepted
+                    ? eventring::Kind::INNER_BLOCK : eventring::Kind::INNER_CLEAR);
+            }
+            if (rt.outer.accepted != outer_was) {
+                console::noteEvent(now_ms, i, rt.outer.accepted
+                    ? eventring::Kind::OUTER_BLOCK : eventring::Kind::OUTER_CLEAR);
+            }
+            switch (u.event) {
+            case gatelogic::GateEvent::BEE_IN:
+                console::noteEvent(now_ms, i, eventring::Kind::BEE_IN);
+                break;
+            case gatelogic::GateEvent::BEE_OUT:
+                console::noteEvent(now_ms, i, eventring::Kind::BEE_OUT);
+                break;
+            case gatelogic::GateEvent::GLITCH:
+                console::noteEvent(now_ms, i, eventring::Kind::GLITCH);
+                break;
+            case gatelogic::GateEvent::NONE:
+            default:
+                break;
+            }
+        }
 
         switch (u.event) {
         case gatelogic::GateEvent::BEE_IN:  countCrossing(g_total_in);  break;
@@ -631,209 +713,6 @@ static bool pollAllGates() {
     return ok;
 }
 
-// ============================================================================
-// USB serial IR-sensor debug console  (compile-time, -DIR_DEBUG only)
-// ============================================================================
-//
-// A tiny interactive console for bench bring-up: it lets you watch the raw
-// inner/outer beam state of all 24 gates over the USB CDC serial link without
-// any HiveScale / I2C master attached. It is intentionally excluded from the
-// production build — none of this code is compiled unless -DIR_DEBUG is set.
-// No PlatformIO environment defines it; build the console ad hoc with
-//     PLATFORMIO_BUILD_FLAGS=-DIR_DEBUG pio run -t upload
-//
-// Commands (single keypress in the serial monitor):
-//   r  read & print every gate's sensors once
-//   s  toggle continuous streaming (every DBG_STREAM_INTERVAL_MS)
-//   1  force IR LEDs ON   (steady)
-//   0  force IR LEDs OFF
-//   a  IR LEDs AUTO       (normal pulsed mode)
-//   n  arm a 60 s night-mode suspension (press again to resume)
-//   4  toggle emitter bank 1 (gates 00..07)
-//   5  toggle emitter bank 2 (gates 10..17)
-//   6  toggle emitter bank 3 (gates 20..27)
-//   h  print the command list
-//
-// The bank keys are 4/5/6 because the schematic calls those rails /GPIO4,
-// /GPIO5 and /GPIO6 — misleading net names (they are physically GPIO19/20/18,
-// see pins.h) but the labels silkscreened next to the FETs, which is what
-// someone with a probe in one hand is actually reading.
-// ============================================================================
-#ifdef IR_DEBUG
-
-static bool     g_dbg_stream  = false;
-static uint32_t g_dbg_last_ms = 0;
-static constexpr uint32_t DBG_STREAM_INTERVAL_MS = 200;
-
-static void irDebugPrintHelp() {
-    slog::printf("[IR-DEBUG] interactive sensor console — commands:");
-    slog::printf("  r  read & print all 24 gates once");
-    slog::printf("  s  toggle continuous streaming (~200 ms)");
-    slog::printf("  i  scan the master I2C bus for devices");
-    slog::printf("  1  force IR LEDs ON (steady)");
-    slog::printf("  0  force IR LEDs OFF");
-    slog::printf("  a  IR LEDs AUTO (pulsed, normal mode)");
-    slog::printf("  n  arm/clear a 60 s night-mode suspension");
-    slog::printf("  4  toggle emitter bank 1 (gates 00..07)");
-    slog::printf("  5  toggle emitter bank 2 (gates 10..17)");
-    slog::printf("  6  toggle emitter bank 3 (gates 20..27)");
-    slog::printf("  h  show this help");
-}
-
-// Take one fresh reading of all 24 gates and print it. The emitters are pulsed
-// on for the settle+read window regardless of the current LED mode, so the
-// readout is always valid on the bench even in AUTO/FORCE_OFF; afterwards the
-// mode-correct steady level is restored.
-static void irDebugReadAndPrint() {
-    const uint32_t now_ms = millis();
-    driveIrLeds(true);
-    delayMicroseconds(LED_SETTLE_US);
-    bool ok = readAllMcp(now_ms);
-    setIrLeds(true);   // restore mode-correct steady level (OFF in AUTO)
-
-    auto getBit = [](uint16_t v, uint8_t pin) -> bool { return (v >> pin) & 0x1; };
-
-    slog::printf("[IR] t=%lus raw U2=0x%04X U3=0x%04X U4=0x%04X read_ok=%d "
-                  "banks=0x%02X\n",
-                  (unsigned long)(now_ms / 1000), g_mcp[0].value, g_mcp[1].value,
-                  g_mcp[2].value, ok ? 1 : 0, (unsigned)g_banks.mask);
-    for (uint8_t i = 0; i < gates::NUM_GATES; i++) {
-        const auto& loc = gates::TABLE[i];
-        const int8_t ch = mcpIndexForAddress(loc.mcp_address);
-        if (ch < 0) continue;
-        if (!g_mcp[ch].valid) {
-            // Printing "clear" here would be a lie: an unread chip has no state.
-            slog::printf("  %-8s bank:%u  <no reading: %s>\n", loc.tag,
-                          (unsigned)loc.led_bank,
-                          g_mcp[ch].ok ? "read failed" : "chip unhealthy");
-            continue;
-        }
-        const uint16_t v = g_mcp[ch].value;
-        if (!bankstate::enabled(g_banks, loc.led_bank)) {
-            // The chip answered, but this gate's emitters are switched off, so
-            // whatever the phototransistor says is ambient light and not a
-            // beam state. Saying "clear" here would be the same lie as saying
-            // it for a chip that failed to read.
-            slog::printf("  %-8s bank:%u  <bank disabled>\n", loc.tag,
-                          (unsigned)loc.led_bank);
-            continue;
-        }
-        // BLOCKED == beam reflected/interrupted == sensor line LOW (bit 0).
-        bool inner_blocked = !getBit(v, loc.inner_pin);
-        bool outer_blocked = !getBit(v, loc.outer_pin);
-        // The bank column makes a dead emitter FET obvious on the bench: a
-        // whole bank reading "clear" with bees present points at Q1/Q2/Q3
-        // rather than at the sensors.
-        slog::printf("  %-8s bank:%u inner:%-5s outer:%-5s\n", loc.tag,
-                      (unsigned)loc.led_bank,
-                      inner_blocked ? "BLOCK" : "clear",
-                      outer_blocked ? "BLOCK" : "clear");
-    }
-}
-
-// Probe every 7-bit address on the master bus (Wire) and report what ACKs.
-// This is the quickest way to tell a wiring/pin fault (nothing responds) from
-// an address-strap fault (something responds, but not at the expected 0x20).
-static void irDebugI2cScan() {
-    slog::printf("[IR-DEBUG] scanning master I2C bus (Wire / SDA,SCL in pins.h)...");
-    uint8_t found = 0;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0) {
-            slog::printf("  device ACK at 0x%02X\n", addr);
-            found++;
-        }
-    }
-    if (found == 0) {
-        slog::printf("  no devices responded.");
-        slog::printf("  -> check: SDA/SCL not swapped, pull-ups to 3V3, "
-                     "MCP /RESET high, common GND, A0/A1/A2 strapped");
-    } else {
-        slog::printf("  %u device(s) total. Expected MCP23017s at "
-                      "0x20/0x21/0x22.\n", found);
-    }
-}
-
-// Drain any pending serial input and service streaming. Called from loop().
-static void irDebugPoll() {
-    while (Serial.available() > 0) {
-        int c = Serial.read();
-        switch (c) {
-        case 'r':
-            irDebugReadAndPrint();
-            break;
-        case 's':
-            g_dbg_stream  = !g_dbg_stream;
-            g_dbg_last_ms = 0;   // stream immediately on enable
-            slog::printf("[IR-DEBUG] streaming %s\n", g_dbg_stream ? "ON" : "OFF");
-            break;
-        case 'i':
-            irDebugI2cScan();
-            break;
-        case '1':
-            g_led_mode = LedMode::FORCE_ON;
-            setIrLeds(true);
-            slog::printf("[IR-DEBUG] IR LEDs -> FORCE_ON");
-            break;
-        case '0':
-            g_led_mode = LedMode::FORCE_OFF;
-            setIrLeds(false);
-            slog::printf("[IR-DEBUG] IR LEDs -> FORCE_OFF");
-            break;
-        case 'a':
-            g_led_mode = LedMode::AUTO;
-            setIrLeds(false);
-            slog::printf("[IR-DEBUG] IR LEDs -> AUTO (pulsed)");
-            break;
-        case 'n': {
-            // Exercise the night-mode path without a HiveHub: 60 s is long
-            // enough to watch the emitters go dark and the counts freeze, short
-            // enough that a forgotten bench board resumes on its own.
-            const bool idle_now = !idlestate::sensing(g_idle);
-            const uint32_t granted = ble::applyIdleRequest(idle_now ? 0 : 60);
-            slog::printf("[IR-DEBUG] night mode %s (%lus)\n",
-                          granted ? "ARMED" : "cleared",
-                          (unsigned long)granted);
-            break;
-        }
-        case '4':
-        case '5':
-        case '6': {
-            // Toggle one bank. A refused request (the last bank going off)
-            // reports itself from applyBankMask(), so nothing extra is needed
-            // here to explain why the mask did not move.
-            const uint8_t bank = (uint8_t)(c - '3');   // '4' -> 1
-            const uint8_t bit  = bankstate::bankBit(bank);
-            const uint8_t want = (uint8_t)(g_banks.mask ^ bit);
-            const uint8_t got  = ble::applyBankMask(want);
-            slog::printf("[IR-DEBUG] bank %u %s — mask 0x%02X\n",
-                          (unsigned)bank,
-                          (got & bit) ? "ENABLED" : "disabled",
-                          (unsigned)got);
-            break;
-        }
-        case 'h':
-        case '?':
-            irDebugPrintHelp();
-            break;
-        case '\r':
-        case '\n':
-        case ' ':
-            break;   // ignore whitespace/line endings
-        default:
-            slog::printf("[IR-DEBUG] unknown key '%c' — press 'h' for help\n",
-                          (char)c);
-            break;
-        }
-    }
-
-    if (g_dbg_stream && millis() - g_dbg_last_ms >= DBG_STREAM_INTERVAL_MS) {
-        g_dbg_last_ms = millis();
-        irDebugReadAndPrint();
-    }
-}
-
-#endif  // IR_DEBUG
 
 // ----------------------------------------------------------------------------
 // BLE transport callbacks (defined here because the counter state lives in this
@@ -965,6 +844,106 @@ static void timedPoll() {
                          LATE_POLL_GAP_US);
 }
 
+// ----------------------------------------------------------------------------
+// Diagnostic console views (declared in diag.h). Reads of state the sampler
+// already produced: no I2C, no emitters, no side effects.
+// ----------------------------------------------------------------------------
+namespace diag {
+
+uint8_t numGates() {
+    return gates::NUM_GATES;
+}
+
+static bool sensingNow() {
+    return !ble::isOtaActive() && idlestate::sensing(g_idle);
+}
+
+void gateView(uint8_t gate, GateView& out) {
+    out = GateView();
+    if (gate >= gates::NUM_GATES) return;
+    const auto& loc = gates::TABLE[gate];
+    const gatelogic::GateRuntime& rt = g_gate_rt[gate];
+    const int8_t ch = mcpIndexForAddress(loc.mcp_address);
+
+    out.tag = loc.tag;
+    out.bank = loc.led_bank;
+    out.chip = ch < 0 ? 0 : (uint8_t)ch;
+    out.inner_debounced = rt.inner.accepted;
+    out.outer_debounced = rt.outer.accepted;
+    out.state = rt.state;
+
+    // The same precedence the sampler applies: a dark bank is never sampled,
+    // a paused sampler has nothing current, an unreadable chip has no state.
+    SensorView v;
+    if (!bankstate::enabled(g_banks, loc.led_bank)) {
+        v = SensorView::BANK_OFF;
+    } else if (!sensingNow()) {
+        v = SensorView::STALE;
+    } else if (ch < 0 || !g_mcp[ch].ok || !g_mcp[ch].valid) {
+        v = SensorView::INVALID;
+    } else if (!g_mcp[ch].stats.have_ok ||
+               millis() - g_mcp[ch].stats.last_ok_ms > SNAPSHOT_STALE_MS) {
+        v = SensorView::STALE;
+    } else {
+        v = SensorView::CLEAR;   // resolved per sensor below
+    }
+    if (v != SensorView::CLEAR) {
+        out.inner_raw = v;
+        out.outer_raw = v;
+        return;
+    }
+    // BLOCKED == sensor line LOW == bit 0.
+    const uint16_t w = g_mcp[ch].value;
+    out.inner_raw = ((w >> loc.inner_pin) & 1) ? SensorView::CLEAR : SensorView::BLOCKED;
+    out.outer_raw = ((w >> loc.outer_pin) & 1) ? SensorView::CLEAR : SensorView::BLOCKED;
+}
+
+void chipView(uint8_t chip, ChipView& out) {
+    out = ChipView();
+    if (chip >= NUM_MCP) return;
+    const McpHealth& m = g_mcp[chip];
+    out.name = m.name;
+    out.addr = m.addr;
+    out.healthy = m.ok;
+    out.last_read_ok = m.valid;
+    out.fail_streak = m.fail_streak;
+    out.last_word = m.stats.last_word;
+    out.last_ok_age_ms = m.stats.have_ok
+        ? (uint32_t)(millis() - m.stats.last_ok_ms) : UINT32_MAX;
+    out.reads_ok = m.stats.reads_ok;
+    out.nacks = m.stats.nacks;
+    out.short_reads = m.stats.short_reads;
+    out.lost = m.stats.lost;
+    out.recovered = m.stats.recovered;
+    out.max_read_us = m.stats.max_read_us;
+}
+
+void statusView(StatusView& out) {
+    out = StatusView();
+    const uint32_t now = millis();
+    out.uptime_ms = now;
+    out.total_in = g_total_in;
+    out.total_out = g_total_out;
+    out.glitches = g_glitch_count;
+    out.status_flags = g_status_flags;
+    out.bank_mask = g_banks.mask;
+    out.idle_s = idlestate::remainingSeconds(g_idle, now);
+    out.ota_active = ble::isOtaActive();
+    out.sensing = sensingNow();
+    out.poll_interval_ms = POLL_INTERVAL_MS;
+    out.late_after_us = LATE_POLL_GAP_US;
+    out.polls = g_timing.boot.polls;
+    out.late = g_timing.boot.late;
+    out.max_gap_us = g_timing.boot.max_gap_us;
+    out.max_poll_us = g_timing.boot.max_duration_us;
+    out.window_polls = g_timing.window.polls;
+    out.window_late = g_timing.window.late;
+    out.window_max_gap_us = g_timing.window.max_gap_us;
+    out.window_max_poll_us = g_timing.window.max_duration_us;
+}
+
+}  // namespace diag
+
 void setup() {
     slog::begin(115200);
     delay(200);
@@ -1016,11 +995,7 @@ void setup() {
                   (unsigned)pins::NUM_LED_BANKS,
                   (unsigned)(bankstate::enabledCount(g_banks) * 8u));
     slog::printf("[SETUP] Entering normal counting loop (pulsed IR)");
-
-#ifdef IR_DEBUG
-    slog::printf("[SETUP] IR_DEBUG build — USB sensor console enabled");
-    irDebugPrintHelp();
-#endif
+    console::begin();
 }
 
 void loop() {
@@ -1029,11 +1004,6 @@ void loop() {
     ble::loopOta();
 
     const uint32_t now = millis();
-
-#ifdef IR_DEBUG
-    // Service the USB serial sensor console (bench bring-up builds only).
-    irDebugPoll();
-#endif
 
     // ---- Poll the MCP23017s every POLL_INTERVAL_MS ----
     // An OTA pauses sensing: flash writes must not leave an emitter pulse
@@ -1092,6 +1062,10 @@ void loop() {
             driveIrLeds(false);
         }
     }
+
+    // USB console: input, paced report/watch/event output. After this pass's
+    // sampling, so nothing it does can delay a poll that is already due.
+    console::poll(now);
 
     // Periodic debug dump on serial -- once every 30 s.
     static uint32_t last_dump_ms = 0;

@@ -314,8 +314,7 @@ Three things follow, and all three are implemented:
 * **Pulsed emitters** (`LedMode::AUTO`, the default since the 2026-06 revision)
   cut the duty cycle from 100 % to ~35 %. Raising `POLL_INTERVAL_MS` lowers it
   proportionally. There is no `CMD_LEDS_OFF` — that was an I²C command on the
-  wired link, which no longer exists; the bench overrides are the `-DIR_DEBUG`
-  console's `1`/`0`/`a` keys.
+  wired link, which no longer exists.
 * **Night mode** parks the emitters entirely through the hours honey bees do not
   fly, on request from HiveHub. Over an 8–12 h night that is the difference
   between the counter fitting an off-grid budget and not. See
@@ -404,9 +403,8 @@ Implemented in `Firmware/` (PlatformIO, `seeed_xiao_esp32c6` env). See
   in `Firmware/include/gate_logic.h` and is covered by host-side tests
   (`Firmware/test/run_tests.sh`).
 - IR banks driven on GPIO19 / silk D8 (bank 1), GPIO20 / silk D9 (bank 2) and
-  GPIO18 / silk D10 (bank 3) — one MOSFET per MCP23017. LED mode and per-bank
-  enables are both settable from the IR_DEBUG serial console (`1`/`0`/`a` and
-  `4`/`5`/`6`), and the bank mask is settable over BLE by HiveHub.
+  GPIO18 / silk D10 (bank 3) — one MOSFET per MCP23017. The bank mask is
+  settable over BLE by HiveHub.
 - BLE OTA image receiver (`Update` library) with size + CRC-32 verification
   before the inactive app slot is selected.
 

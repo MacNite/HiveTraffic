@@ -341,9 +341,8 @@ every document including the `7` of a counter nobody has reconfigured: a field
 that appeared only when it was interesting would make "all banks on" and
 "counter too old to say" the same absence.
 
-On the bench the `-DIR_DEBUG` console toggles banks live with the `4`, `5` and
-`6` keys (named for the schematic's `/GPIO4`, `/GPIO5`, `/GPIO6` FET rails), and
-prints the mask on every readout.
+On the bench, the USB console's `status` command prints the mask in force, and
+`watch` shows the gates of a dark bank as `-`.
 
 ## Firmware update over connectable BLE
 

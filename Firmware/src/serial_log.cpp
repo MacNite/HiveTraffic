@@ -62,6 +62,10 @@ void printf(const char* fmt, ...) {
     }
 }
 
+int writable() {
+    return Serial.availableForWrite();
+}
+
 uint32_t droppedLines() {
     return __atomic_load_n(&g_dropped, __ATOMIC_RELAXED);
 }

@@ -27,6 +27,11 @@ void begin(unsigned long baud);
 // is always sent. Dropped whole if the TX ring cannot take all of it.
 void printf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// Bytes the USB TX ring can take right now without dropping anything. The
+// console uses it to hold queued output back rather than lose it: a report or
+// an event waits in its own queue until a whole line fits.
+int writable();
+
 // Lines dropped since boot because the TX ring was full (no host reading, or
 // output faster than USB drains it). Saturating.
 uint32_t droppedLines();
